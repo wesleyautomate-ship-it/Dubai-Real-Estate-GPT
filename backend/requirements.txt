@@ -1,0 +1,33 @@
+# Dubai Real Estate AI - Backend Requirements
+
+# Core Dependencies
+requests>=2.31.0
+pandas>=2.1.0
+numpy>=1.24.0
+
+# Database
+psycopg2-binary>=2.9.9
+
+# Analytics
+scipy>=1.11.0
+duckdb>=0.9.0
+
+# API (FastAPI)
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.4.0
+httpx>=0.25.0
+slowapi>=0.1.9
+
+# AI/ML
+openai>=1.0.0
+
+# Utilities
+python-dotenv>=1.0.0
+python-multipart>=0.0.6
+rapidfuzz>=3.0.0
+
+# Development
+pytest>=7.4.0
+black>=23.10.0
+tqdm>=4.66.0

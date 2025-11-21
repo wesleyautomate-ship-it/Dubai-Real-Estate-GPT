@@ -1,0 +1,1395 @@
+{
+  "act two": {
+    "master": "Downtown Dubai",
+    "district": "Opera District",
+    "project": "Act One | Act Two Towers",
+    "building": "Act Two",
+    "alias": null
+  },
+  "st. regis the residences tower 1": {
+    "master": "Downtown Dubai",
+    "district": "St. Regis The Residences",
+    "project": "St. Regis The Residences Tower 1",
+    "building": "St. Regis The Residences Tower 1",
+    "alias": null
+  },
+  "vida dubai mall tower 1": {
+    "master": "Downtown Dubai",
+    "district": "Vida Dubai Mall",
+    "project": "Vida Dubai Mall Tower 1",
+    "building": "Vida Dubai Mall Tower 1",
+    "alias": null
+  },
+  "forte 2": {
+    "master": "Downtown Dubai",
+    "district": "Forte",
+    "project": "Forte 2",
+    "building": "Forte 2",
+    "alias": null
+  },
+  "society house": {
+    "master": "Downtown Dubai",
+    "district": "Society House",
+    "project": "Society House",
+    "building": "Society House",
+    "alias": null
+  },
+  "damac maison mall street (the signature)": {
+    "master": "Downtown Dubai",
+    "district": "DAMAC Maison Mall Street (The Signature)",
+    "project": "DAMAC Maison Mall Street (The Signature)",
+    "building": "DAMAC Maison Mall Street (The Signature)",
+    "alias": null
+  },
+  "the address residences dubai opera tower 1": {
+    "master": "Downtown Dubai",
+    "district": "The Address Residences Dubai Opera",
+    "project": "The Address Residences Dubai Opera Tower 1",
+    "building": "The Address Residences Dubai Opera Tower 1",
+    "alias": null
+  },
+  "blvd heights tower 2": {
+    "master": "Downtown Dubai",
+    "district": "BLVD Heights",
+    "project": "BLVD Heights Tower 2",
+    "building": "BLVD Heights Tower 2",
+    "alias": null
+  },
+  "29 boulevard 1": {
+    "master": "Downtown Dubai",
+    "district": "29 Boulevard",
+    "project": "29 Boulevard 1",
+    "building": "29 Boulevard 1",
+    "alias": null
+  },
+  "8 boulevard walk": {
+    "master": "Downtown Dubai",
+    "district": "Mohammad Bin Rashid Boulevard",
+    "project": "8 Boulevard Walk",
+    "building": "8 Boulevard Walk",
+    "alias": null
+  },
+  "yansoon 6": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Yansoon",
+    "building": "Yansoon 6",
+    "alias": null
+  },
+  "bellevue tower 1": {
+    "master": "Downtown Dubai",
+    "district": "Bellevue Towers",
+    "project": "Bellevue Tower 1",
+    "building": "Bellevue Tower 1",
+    "alias": null
+  },
+  "boulevard central 1": {
+    "master": "Downtown Dubai",
+    "district": "Boulevard Central",
+    "project": "Boulevard Central 1",
+    "building": "Boulevard Central 1",
+    "alias": null
+  },
+  "the address sky view tower 1": {
+    "master": "Downtown Dubai",
+    "district": "The Address Residence Sky View",
+    "project": "The Address Sky View Tower 1",
+    "building": "The Address Sky View Tower 1",
+    "alias": null
+  },
+  "29 boulevard 2": {
+    "master": "Downtown Dubai",
+    "district": "29 Boulevard",
+    "project": "29 Boulevard 2",
+    "building": "29 Boulevard 2",
+    "alias": null
+  },
+  "the residence 8": {
+    "master": "Downtown Dubai",
+    "district": "The Residences",
+    "project": "The Residence 8",
+    "building": "The Residence 8",
+    "alias": null
+  },
+  "the address the blvd": {
+    "master": "Downtown Dubai",
+    "district": "The Address The Blvd",
+    "project": "The Address The Blvd",
+    "building": "The Address The Blvd",
+    "alias": null
+  },
+  "the residence 1": {
+    "master": "Downtown Dubai",
+    "district": "The Residences",
+    "project": "The Residence 1",
+    "building": "The Residence 1",
+    "alias": null
+  },
+  "the address fountain views 1": {
+    "master": "Downtown Dubai",
+    "district": "Address Dubai Mall",
+    "project": "The Address Fountain Views 1",
+    "building": "The Address Fountain Views 1",
+    "alias": null
+  },
+  "volta": {
+    "master": "Downtown Dubai",
+    "district": "Volta",
+    "project": "Volta",
+    "building": "Volta",
+    "alias": null
+  },
+  "burj vista 2": {
+    "master": "Downtown Dubai",
+    "district": "Burj Vista",
+    "project": "Burj Vista 2",
+    "building": "Burj Vista 2",
+    "alias": null
+  },
+  "blvd heights tower 1": {
+    "master": "Downtown Dubai",
+    "district": "BLVD Heights",
+    "project": "BLVD Heights Tower 1",
+    "building": "BLVD Heights Tower 1",
+    "alias": null
+  },
+  "vida residence downtown": {
+    "master": "Downtown Dubai",
+    "district": "VIDA RESIDENCE DOWNTOWN DUBAI",
+    "project": "VIDA RESIDENCE DOWNTOWN",
+    "building": "VIDA RESIDENCE DOWNTOWN",
+    "alias": null
+  },
+  "upper crest (burjside terrace)": {
+    "master": "Downtown Dubai",
+    "district": "Upper Crest (Burjside Terrace)",
+    "project": "Upper Crest (Burjside Terrace)",
+    "building": "Upper Crest (Burjside Terrace)",
+    "alias": null
+  },
+  "forte 1": {
+    "master": "Downtown Dubai",
+    "district": "Forte",
+    "project": "Forte 1",
+    "building": "Forte 1",
+    "alias": null
+  },
+  "boulevard point": {
+    "master": "Downtown Dubai",
+    "district": "Boulevard Point",
+    "project": "Boulevard Point",
+    "building": "Boulevard Point",
+    "alias": null
+  },
+  "the address residences dubai opera tower 2": {
+    "master": "Downtown Dubai",
+    "district": "The Address Residences Dubai Opera",
+    "project": "The Address Residences Dubai Opera Tower 2",
+    "building": "The Address Residences Dubai Opera Tower 2",
+    "alias": null
+  },
+  "armani hotel and residences": {
+    "master": "Downtown Dubai",
+    "district": "Armani Hotel and Residences",
+    "project": "Armani Hotel and Residences",
+    "building": "Armani Hotel and Residences",
+    "alias": null
+  },
+  "the address sky view tower 2": {
+    "master": "Downtown Dubai",
+    "district": "The Address Residence Sky View",
+    "project": "The Address Sky View Tower 2",
+    "building": "The Address Sky View Tower 2",
+    "alias": null
+  },
+  "vida dubai mall tower 2": {
+    "master": "Downtown Dubai",
+    "district": "Vida Dubai Mall",
+    "project": "Vida Dubai Mall Tower 2",
+    "building": "Vida Dubai Mall Tower 2",
+    "alias": null
+  },
+  "burj views podium": {
+    "master": "Downtown Dubai",
+    "district": "BURJ VIEWS",
+    "project": "Burj Views Podium",
+    "building": "Burj Views Podium",
+    "alias": null
+  },
+  "burj crown": {
+    "master": "Downtown Dubai",
+    "district": "Burj Crown",
+    "project": "Burj Crown",
+    "building": "Burj Crown",
+    "alias": null
+  },
+  "tajer residence": {
+    "master": "Downtown Dubai",
+    "district": "The Old Town Island",
+    "project": "Tajer Residence",
+    "building": "Tajer Residence",
+    "alias": null
+  },
+  "damac maison the distinction": {
+    "master": "Downtown Dubai",
+    "district": "DAMAC Maison The Distinction",
+    "project": "DAMAC Maison The Distinction",
+    "building": "DAMAC Maison The Distinction",
+    "alias": null
+  },
+  "standpoint tower 1": {
+    "master": "Downtown Dubai",
+    "district": "Standpoint Towers",
+    "project": "Standpoint Tower 1",
+    "building": "Standpoint Tower 1",
+    "alias": null
+  },
+  "dt1 tower": {
+    "master": "Downtown Dubai",
+    "district": "DT1 Tower",
+    "project": "DT1 Tower",
+    "building": "DT1 Tower",
+    "alias": null
+  },
+  "exquisite living residences": {
+    "master": "Downtown Dubai",
+    "district": "EXQUISITE LIVING RESIDENCES",
+    "project": "EXQUISITE LIVING RESIDENCES",
+    "building": "EXQUISITE LIVING RESIDENCES",
+    "alias": null
+  },
+  "burj views a": {
+    "master": "Downtown Dubai",
+    "district": "Burj Views",
+    "project": "Burj Views A",
+    "building": "Burj Views A",
+    "alias": null
+  },
+  "bellevue tower 2": {
+    "master": "Downtown Dubai",
+    "district": "Bellevue Towers",
+    "project": "Bellevue Tower 2",
+    "building": "Bellevue Tower 2",
+    "alias": null
+  },
+  "imperial avenue": {
+    "master": "Downtown Dubai",
+    "district": "Imperial  Avenue",
+    "project": "Imperial Avenue",
+    "building": "Imperial Avenue",
+    "alias": null
+  },
+  "the residence 5": {
+    "master": "Downtown Dubai",
+    "district": "The Residences",
+    "project": "The Residence 5",
+    "building": "The Residence 5",
+    "alias": null
+  },
+  "reehan 6": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "REEHAN 6",
+    "building": "REEHAN 6",
+    "alias": null
+  },
+  "act one": {
+    "master": "Downtown Dubai",
+    "district": "Opera District",
+    "project": "Act One | Act Two Towers",
+    "building": "Act One",
+    "alias": null
+  },
+  "reehan 4": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Reehan",
+    "building": "Reehan 4",
+    "alias": null
+  },
+  "opera grand": {
+    "master": "Downtown Dubai",
+    "district": "Opera Grand",
+    "project": "Opera Grand",
+    "building": "Opera Grand",
+    "alias": null
+  },
+  "standpoint tower 2": {
+    "master": "Downtown Dubai",
+    "district": "Standpoint Towers",
+    "project": "Standpoint Tower 2",
+    "building": "Standpoint Tower 2",
+    "alias": null
+  },
+  "w residences": {
+    "master": "Downtown Dubai",
+    "district": "W Residences",
+    "project": "W Residences",
+    "building": "W Residences",
+    "alias": null
+  },
+  "st. regis the residences tower 2": {
+    "master": "Downtown Dubai",
+    "district": "St. Regis The Residences",
+    "project": "St. Regis The Residences Tower 2",
+    "building": "St. Regis The Residences Tower 2",
+    "alias": null
+  },
+  "il primo": {
+    "master": "Downtown Dubai",
+    "district": "Il PRIMO",
+    "project": "IL Primo",
+    "building": "IL Primo",
+    "alias": null
+  },
+  "rove home": {
+    "master": "Downtown Dubai",
+    "district": "Rove Home",
+    "project": "Rove Home",
+    "building": "Rove Home",
+    "alias": null
+  },
+  "the residence 9": {
+    "master": "Downtown Dubai",
+    "district": "The Residences",
+    "project": "The Residence 9",
+    "building": "The Residence 9",
+    "alias": null
+  },
+  "the address downtown hotel (lake hotel)": {
+    "master": "Downtown Dubai",
+    "district": "The Address Downtown Hotel (Lake Hotel)",
+    "project": "The Address Downtown Hotel (Lake Hotel)",
+    "building": "The Address Downtown Hotel (Lake Hotel)",
+    "alias": null
+  },
+  "claren tower 2": {
+    "master": "Downtown Dubai",
+    "district": "Claren Towers",
+    "project": "Claren Tower 2",
+    "building": "Claren Tower 2",
+    "alias": null
+  },
+  "the address fountain views 2": {
+    "master": "Downtown Dubai",
+    "district": "Address Dubai Mall",
+    "project": "The Address Fountain Views 2",
+    "building": "The Address Fountain Views 2",
+    "alias": null
+  },
+  "mada residences": {
+    "master": "Downtown Dubai",
+    "district": "Mada Residences",
+    "project": "Mada Residences",
+    "building": "Mada Residences",
+    "alias": null
+  },
+  "south ridge 3": {
+    "master": "Downtown Dubai",
+    "district": "South Ridge",
+    "project": "South Ridge 3",
+    "building": "South Ridge 3",
+    "alias": null
+  },
+  "miska 4": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "MISKA 4",
+    "building": "MISKA 4",
+    "alias": null
+  },
+  "grande": {
+    "master": "Downtown Dubai",
+    "district": "Grande",
+    "project": "Grande",
+    "building": "Grande",
+    "alias": null
+  },
+  "burj vista 1": {
+    "master": "Downtown Dubai",
+    "district": "Burj Vista",
+    "project": "Burj Vista 1",
+    "building": "Burj Vista 1",
+    "alias": null
+  },
+  "elite 1 downtown residence": {
+    "master": "Downtown Dubai",
+    "district": "Elite 1 Downtown Residence",
+    "project": "Elite 1 Downtown Residence",
+    "building": "Elite 1 Downtown Residence",
+    "alias": null
+  },
+  "kempinski central avenue dubai": {
+    "master": "Downtown Dubai",
+    "district": "Kempinski Central Avenue Dubai",
+    "project": "Kempinski Central Avenue Dubai",
+    "building": "Kempinski Central Avenue Dubai",
+    "alias": null
+  },
+  "burj royale": {
+    "master": "Downtown Dubai",
+    "district": "Burj Royale",
+    "project": "Burj Royale",
+    "building": "Burj Royale",
+    "alias": null
+  },
+  "the residence 7": {
+    "master": "Downtown Dubai",
+    "district": "The Residences",
+    "project": "The Residence 7",
+    "building": "The Residence 7",
+    "alias": null
+  },
+  "miska 1": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Miska",
+    "building": "Miska 1",
+    "alias": "MISKA 1"
+  },
+  "the lofts podium": {
+    "master": "Downtown Dubai",
+    "district": "The Lofts",
+    "project": "The Lofts Podium",
+    "building": "The Lofts Podium",
+    "alias": null
+  },
+  "south ridge 6": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "South Ridge 6",
+    "building": "South Ridge 6",
+    "alias": null
+  },
+  "boulevard central 2": {
+    "master": "Downtown Dubai",
+    "district": "Boulevard Central",
+    "project": "Boulevard Central 2",
+    "building": "Boulevard Central 2",
+    "alias": null
+  },
+  "attareen": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "ATTAREEN",
+    "building": "ATTAREEN",
+    "alias": null
+  },
+  "south ridge 1": {
+    "master": "Downtown Dubai",
+    "district": "South Ridge",
+    "project": "South Ridge 1",
+    "building": "South Ridge 1",
+    "alias": null
+  },
+  "south ridge 2": {
+    "master": "Downtown Dubai",
+    "district": "South Ridge",
+    "project": "South Ridge 2",
+    "building": "South Ridge 2",
+    "alias": null
+  },
+  "kamoon 2": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Kamoon",
+    "building": "Kamoon 2",
+    "alias": "KAMOON 2"
+  },
+  "burj al nujoom": {
+    "master": "Downtown Dubai",
+    "district": "Burj Al Nujoom",
+    "project": "Burj Al Nujoom",
+    "building": "Burj Al Nujoom",
+    "alias": null
+  },
+  "the address fountain views sky collection 2": {
+    "master": "Downtown Dubai",
+    "district": "Address Dubai Mall",
+    "project": "The Address Fountain Views Sky Collection 2",
+    "building": "The Address Fountain Views Sky Collection 2",
+    "alias": "Address Residences Sky View 2"
+  },
+  "the lofts west": {
+    "master": "Downtown Dubai",
+    "district": "The Lofts",
+    "project": "The Lofts West",
+    "building": "The Lofts West",
+    "alias": null
+  },
+  "yansoon 2": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Yansoon",
+    "building": "Yansoon 2",
+    "alias": null
+  },
+  "south ridge": {
+    "master": "Downtown Dubai",
+    "district": "South Ridge",
+    "project": "South Ridge",
+    "building": "South Ridge",
+    "alias": null
+  },
+  "the lofts central tower": {
+    "master": "Downtown Dubai",
+    "district": "The Lofts",
+    "project": "The Lofts Central Tower",
+    "building": "The Lofts Central Tower",
+    "alias": null
+  },
+  "mercedes benz places by binghatti": {
+    "master": "Downtown Dubai",
+    "district": "Mercedes Benz Places by Binghatti",
+    "project": "Mercedes Benz Places by Binghatti",
+    "building": "Mercedes Benz Places by Binghatti",
+    "alias": "Mercedes-Benz Places/Binghatti"
+  },
+  "boulevard crescent tower 2": {
+    "master": "Downtown Dubai",
+    "district": "Boulevard Crescent Towers",
+    "project": "Boulevard Crescent Tower 2",
+    "building": "Boulevard Crescent Tower 2",
+    "alias": null
+  },
+  "the residence 4": {
+    "master": "Downtown Dubai",
+    "district": "The Residences",
+    "project": "The Residence 4",
+    "building": "The Residence 4",
+    "alias": null
+  },
+  "the residence 3": {
+    "master": "Downtown Dubai",
+    "district": "The Residences",
+    "project": "The Residence 3",
+    "building": "The Residence 3",
+    "alias": null
+  },
+  "saaha offices block b": {
+    "master": "Downtown Dubai",
+    "district": "The Old Town Island",
+    "project": "Al Saaha Offices",
+    "building": "Saaha Offices Block B",
+    "alias": null
+  },
+  "south ridge 4": {
+    "master": "Downtown Dubai",
+    "district": "South Ridge",
+    "project": "South Ridge 4",
+    "building": "South Ridge 4",
+    "alias": null
+  },
+  "yansoon 3": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Yansoon",
+    "building": "Yansoon 3",
+    "alias": null
+  },
+  "downtown dubai": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "Downtown Dubai",
+    "building": "Downtown Dubai",
+    "alias": null
+  },
+  "dunya tower": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "Dunya Tower",
+    "building": "Dunya Tower",
+    "alias": null
+  },
+  "mon reve": {
+    "master": "Downtown Dubai",
+    "district": "Mon Reve",
+    "project": "Mon Reve",
+    "building": "Mon Reve",
+    "alias": null
+  },
+  "boulevard crescent tower 1": {
+    "master": "Downtown Dubai",
+    "district": "Boulevard Crescent Towers",
+    "project": "Boulevard Crescent Tower 1",
+    "building": "Boulevard Crescent Tower 1",
+    "alias": null
+  },
+  "zaafaran 1": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Zaafaran",
+    "building": "Zaafaran 1",
+    "alias": null
+  },
+  "zanzebeel 2": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Zanzebeel",
+    "building": "Zanzebeel 2",
+    "alias": null
+  },
+  "yansoon 8": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Yansoon",
+    "building": "Yansoon 8",
+    "alias": "YANSOON 8"
+  },
+  "burj views b": {
+    "master": "Downtown Dubai",
+    "district": "Burj Views",
+    "project": "Burj Views B",
+    "building": "Burj Views B",
+    "alias": null
+  },
+  "reehan 2": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Reehan",
+    "building": "Reehan 2",
+    "alias": null
+  },
+  "zanzebeel 4": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Zanzebeel",
+    "building": "Zanzebeel 4",
+    "alias": null
+  },
+  "elegance tower": {
+    "master": "Downtown Dubai",
+    "district": "Elegance Tower",
+    "project": "Elegance Tower",
+    "building": "Elegance Tower",
+    "alias": null
+  },
+  "baccarat hotel and residences": {
+    "master": "Downtown Dubai",
+    "district": "Baccarat Hotel And Residences",
+    "project": "Baccarat Hotel And Residences",
+    "building": "Baccarat Hotel And Residences",
+    "alias": null
+  },
+  "118 downtown": {
+    "master": "Downtown Dubai",
+    "district": "Mohammad Bin Rashid Boulevard",
+    "project": "118 Downtown",
+    "building": "118 Downtown",
+    "alias": "THE 118"
+  },
+  "yansoon 1": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Yansoon",
+    "building": "Yansoon 1",
+    "alias": "YANSOON 1"
+  },
+  "yansoon 9": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Yansoon",
+    "building": "Yansoon 9",
+    "alias": "YANSOON 9"
+  },
+  "claren tower 1": {
+    "master": "Downtown Dubai",
+    "district": "CLAREN 1",
+    "project": "CLAREN TOWER 1",
+    "building": "CLAREN TOWER 1",
+    "alias": null
+  },
+  "boulevard plaza tower 1": {
+    "master": "Downtown Dubai",
+    "district": "Boulevard Plaza Tower",
+    "project": "Boulevard Plaza Tower 1",
+    "building": "Boulevard Plaza Tower 1",
+    "alias": null
+  },
+  "south ridge 5": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "South Ridge 5",
+    "building": "South Ridge 5",
+    "alias": null
+  },
+  "reehan 1": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Reehan",
+    "building": "Reehan 1",
+    "alias": null
+  },
+  "reehan 3": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Reehan",
+    "building": "Reehan 3",
+    "alias": null
+  },
+  "burj views c": {
+    "master": "Downtown Dubai",
+    "district": "Burj Views",
+    "project": "Burj Views C",
+    "building": "Burj Views C",
+    "alias": null
+  },
+  "reehan 5": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "REEHAN 5",
+    "building": "REEHAN 5",
+    "alias": null
+  },
+  "miska 3": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Miska",
+    "building": "Miska 3",
+    "alias": null
+  },
+  "rp heights": {
+    "master": "Downtown Dubai",
+    "district": "RP HEIGHTS",
+    "project": "RP HEIGHTS",
+    "building": "RP HEIGHTS",
+    "alias": null
+  },
+  "boulevard crescent podium": {
+    "master": "Downtown Dubai",
+    "district": "Boulevard Crescent Towers",
+    "project": "Boulevard Crescent Podium",
+    "building": "Boulevard Crescent Podium",
+    "alias": "BLVD CRESCENT Podium"
+  },
+  "zaafaran 2": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Zaafaran",
+    "building": "Zaafaran 2",
+    "alias": null
+  },
+  "the address fountain views 3": {
+    "master": "Downtown Dubai",
+    "district": "Address Dubai Mall",
+    "project": "The Address Fountain Views 3",
+    "building": "The Address Fountain Views 3",
+    "alias": null
+  },
+  "souk al bahar": {
+    "master": "Downtown Dubai",
+    "district": "Souk Al Bahar",
+    "project": "Souk Al Bahar",
+    "building": "Souk Al Bahar",
+    "alias": null
+  },
+  "the lofts east": {
+    "master": "Downtown Dubai",
+    "district": "The Lofts",
+    "project": "The Lofts East",
+    "building": "The Lofts East",
+    "alias": null
+  },
+  "zanzebeel 3": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Zanzebeel",
+    "building": "Zanzebeel 3",
+    "alias": null
+  },
+  "yansoon 5": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Yansoon",
+    "building": "Yansoon 5",
+    "alias": null
+  },
+  "the residence burj khalifa": {
+    "master": "Downtown Dubai",
+    "district": "The Residence Burj Khalifa",
+    "project": "The Residence Burj Khalifa",
+    "building": "The Residence Burj Khalifa",
+    "alias": null
+  },
+  "reehan 7": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Reehan",
+    "building": "Reehan 7",
+    "alias": null
+  },
+  "blvd heights podium": {
+    "master": "Downtown Dubai",
+    "district": "BLVD Heights",
+    "project": "BLVD Heights Podium",
+    "building": "BLVD Heights Podium",
+    "alias": "Blvd Heights Podium"
+  },
+  "bahwan tower": {
+    "master": "Downtown Dubai",
+    "district": "BAHWAN TOWER",
+    "project": "BAHWAN TOWER",
+    "building": "BAHWAN TOWER",
+    "alias": null
+  },
+  "29 boulevard podium": {
+    "master": "Downtown Dubai",
+    "district": "29 Boulevard",
+    "project": "29 Boulevard Podium",
+    "building": "29 Boulevard Podium",
+    "alias": null
+  },
+  "kamoon 3": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Kamoon",
+    "building": "Kamoon 3",
+    "alias": null
+  },
+  "zanzebeel 1": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Zanzebeel",
+    "building": "Zanzebeel 1",
+    "alias": null
+  },
+  "kamoon 1": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Kamoon",
+    "building": "Kamoon 1",
+    "alias": null
+  },
+  "kamoon 4": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Kamoon",
+    "building": "Kamoon 4",
+    "alias": null
+  },
+  "emaar square building 4": {
+    "master": "Downtown Dubai",
+    "district": "Emaar Square",
+    "project": "Emaar Square Building 4",
+    "building": "Emaar Square Building 4",
+    "alias": "Emaar Square Bldg 4"
+  },
+  "boulevard plaza tower 2": {
+    "master": "Downtown Dubai",
+    "district": "Boulevard Plaza Tower",
+    "project": "Boulevard Plaza Tower 2",
+    "building": "Boulevard Plaza Tower 2",
+    "alias": "BD BLVD Plaza T2"
+  },
+  "the residence 6": {
+    "master": "Downtown Dubai",
+    "district": "The Residences",
+    "project": "The Residence 6",
+    "building": "The Residence 6",
+    "alias": "Residences_E3"
+  },
+  "boulevard central podium": {
+    "master": "Downtown Dubai",
+    "district": "Boulevard Central",
+    "project": "Boulevard Central Podium",
+    "building": "Boulevard Central Podium",
+    "alias": null
+  },
+  "miska 2": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Miska",
+    "building": "Miska 2",
+    "alias": null
+  },
+  "rixos financial center road": {
+    "master": "Downtown Dubai",
+    "district": "Rixos Financial Center Road",
+    "project": "Rixos Financial Center Road",
+    "building": "Rixos Financial Center Road",
+    "alias": null
+  },
+  "claren podium": {
+    "master": "Downtown Dubai",
+    "district": "Claren Towers",
+    "project": "Claren Podium",
+    "building": "Claren Podium",
+    "alias": null
+  },
+  "euphoric residences": {
+    "master": "Downtown Dubai",
+    "district": "Euphoric Residences",
+    "project": "Euphoric Residences",
+    "building": "Euphoric Residences",
+    "alias": null
+  },
+  "yansoon 4": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Yansoon",
+    "building": "Yansoon 4",
+    "alias": null
+  },
+  "yansoon 7": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Yansoon",
+    "building": "Yansoon 7",
+    "alias": null
+  },
+  "one residence": {
+    "master": "Downtown Dubai",
+    "district": "One Residence",
+    "project": "One Residence",
+    "building": "One Residence",
+    "alias": null
+  },
+  "emaar square building 1": {
+    "master": "Downtown Dubai",
+    "district": "Emaar Square",
+    "project": "Emaar Square Building 1",
+    "building": "Emaar Square Building 1",
+    "alias": "Emaar Square Bldg 1"
+  },
+  "azha downtown residences": {
+    "master": "Downtown Dubai",
+    "district": "Azha Downtown Residences",
+    "project": "Azha Downtown Residences",
+    "building": "Azha Downtown Residences",
+    "alias": null
+  },
+  "reehan 8": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Reehan",
+    "building": "Reehan 8",
+    "alias": "REEHAN 8"
+  },
+  "emaar square building 3": {
+    "master": "Downtown Dubai",
+    "district": "Emaar Square",
+    "project": "Emaar Square Building 3",
+    "building": "Emaar Square Building 3",
+    "alias": null
+  },
+  "zaafaran 4": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Zaafaran",
+    "building": "Zaafaran 4",
+    "alias": "ZAAFARAN 4"
+  },
+  "miska 5": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "MISKA 5",
+    "building": "MISKA 5",
+    "alias": null
+  },
+  "the dubai mall residences": {
+    "master": "Downtown Dubai",
+    "district": "THE DUBAI MALL",
+    "project": "THE DUBAI MALL RESIDENCES",
+    "building": "THE DUBAI MALL RESIDENCES",
+    "alias": null
+  },
+  "8 blvd walk": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "8 BLVD WALK",
+    "building": "8 BLVD WALK",
+    "alias": null
+  },
+  "rove home residences by irth": {
+    "master": "Downtown Dubai",
+    "district": "ROVE HOME RESIDENCES by IRTH",
+    "project": "ROVE HOME RESIDENCES by IRTH",
+    "building": "ROVE HOME RESIDENCES by IRTH",
+    "alias": null
+  },
+  "the address residences dubai opera t2": {
+    "master": "Downtown Dubai",
+    "district": "THE ADDRESS DUBAI OPERA",
+    "project": "The Address Residences Dubai Opera T2",
+    "building": "The Address Residences Dubai Opera T2",
+    "alias": null
+  },
+  "blvd heights t1": {
+    "master": "Downtown Dubai",
+    "district": "BLVD HEIGHTS",
+    "project": "Blvd Heights T1",
+    "building": "Blvd Heights T1",
+    "alias": null
+  },
+  "29 blvd t1": {
+    "master": "Downtown Dubai",
+    "district": "29 BOULEVARD",
+    "project": "29 BLVD T1",
+    "building": "29 BLVD T1",
+    "alias": null
+  },
+  "burj views tower b": {
+    "master": "Downtown Dubai",
+    "district": "BURJ VIEWS",
+    "project": "Burj Views Tower B",
+    "building": "Burj Views Tower B",
+    "alias": null
+  },
+  "city center residences": {
+    "master": "Downtown Dubai",
+    "district": "City Center Residences",
+    "project": "City Center Residences",
+    "building": "City Center Residences",
+    "alias": null
+  },
+  "the signature": {
+    "master": "Downtown Dubai",
+    "district": "THE SIGNATURE",
+    "project": "THE SIGNATURE",
+    "building": "THE SIGNATURE",
+    "alias": null
+  },
+  "bd 29 blvd t2": {
+    "master": "Downtown Dubai",
+    "district": "29 BOULEVARD",
+    "project": "BD 29 BLVD T2",
+    "building": "BD 29 BLVD T2",
+    "alias": null
+  },
+  "residences_west poduim": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "Residences_West Poduim",
+    "building": "Residences_West Poduim",
+    "alias": null
+  },
+  "the address - the blvd": {
+    "master": "Downtown Dubai",
+    "district": "THE ADDRESS - THE BLVD",
+    "project": "The Address - The BLVD",
+    "building": "The Address - The BLVD",
+    "alias": null
+  },
+  "the residences ii - tower 3": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "THE RESIDENCES II - TOWER 3",
+    "building": "THE RESIDENCES II - TOWER 3",
+    "alias": null
+  },
+  "burj khalifa": {
+    "master": "Downtown Dubai",
+    "district": "BURJ KHALIFA TOWERS",
+    "project": "Burj Khalifa",
+    "building": "Burj Khalifa",
+    "alias": null
+  },
+  "forte t1": {
+    "master": "Downtown Dubai",
+    "district": "FORTE",
+    "project": "Forte T1",
+    "building": "Forte T1",
+    "alias": null
+  },
+  "elite downtown residence": {
+    "master": "Downtown Dubai",
+    "district": "ELITE DOWNTOWN RESIDENCE",
+    "project": "ELITE DOWNTOWN RESIDENCE",
+    "building": "ELITE DOWNTOWN RESIDENCE",
+    "alias": null
+  },
+  "the st. regis residences - tower 2": {
+    "master": "Downtown Dubai",
+    "district": "The St. Regis Residences, Downtown Dubai",
+    "project": "The St. Regis Residences - Tower 2",
+    "building": "The St. Regis Residences - Tower 2",
+    "alias": null
+  },
+  "burj viewstower a": {
+    "master": "Downtown Dubai",
+    "district": "BURJ VIEWS",
+    "project": "Burj ViewsTower A",
+    "building": "Burj ViewsTower A",
+    "alias": null
+  },
+  "blvd central 2": {
+    "master": "Downtown Dubai",
+    "district": "DD BOULEVARD CENTRAL",
+    "project": "BLVD CENTRAL 2",
+    "building": "BLVD CENTRAL 2",
+    "alias": null
+  },
+  "address fountain views residences - tower 1": {
+    "master": "Downtown Dubai",
+    "district": "The Address Residence-Fountain Views",
+    "project": "Address Fountain Views Residences - Tower 1",
+    "building": "Address Fountain Views Residences - Tower 1",
+    "alias": null
+  },
+  "bd standpoint a": {
+    "master": "Downtown Dubai",
+    "district": "DD STAND POINT",
+    "project": "BD Standpoint A",
+    "building": "BD Standpoint A",
+    "alias": null
+  },
+  "burj vista tower 1": {
+    "master": "Downtown Dubai",
+    "district": "BURJ VISTA",
+    "project": "BURJ VISTA Tower 1",
+    "building": "BURJ VISTA Tower 1",
+    "alias": null
+  },
+  "zaafaran 3": {
+    "master": "Downtown Dubai",
+    "district": "Old Town",
+    "project": "Zaafaran",
+    "building": "Zaafaran 3",
+    "alias": null
+  },
+  "burj khalifa residences": {
+    "master": "Downtown Dubai",
+    "district": "THE RESIDENCE | Burj Khalifa",
+    "project": "Burj Khalifa Residences",
+    "building": "Burj Khalifa Residences",
+    "alias": null
+  },
+  "burj lake hotel - the address downtown": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "Burj Lake Hotel - The Address DownTown",
+    "building": "Burj Lake Hotel - The Address DownTown",
+    "alias": null
+  },
+  "the st. regis residences - tower 1": {
+    "master": "Downtown Dubai",
+    "district": "The St. Regis Residences, Downtown Dubai",
+    "project": "The St. Regis Residences - Tower 1",
+    "building": "The St. Regis Residences - Tower 1",
+    "alias": null
+  },
+  "volta tower": {
+    "master": "Downtown Dubai",
+    "district": "VOLTA TOWER",
+    "project": "VOLTA TOWER",
+    "building": "VOLTA TOWER",
+    "alias": null
+  },
+  "the address residences dubai opera t1": {
+    "master": "Downtown Dubai",
+    "district": "THE ADDRESS DUBAI OPERA",
+    "project": "The Address Residences Dubai Opera T1",
+    "building": "The Address Residences Dubai Opera T1",
+    "alias": null
+  },
+  "bellevue towers-1": {
+    "master": "Downtown Dubai",
+    "district": "BELLEVUE TOWERS",
+    "project": "Bellevue Towers-1",
+    "building": "Bellevue Towers-1",
+    "alias": null
+  },
+  "altajer": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "ALTAJER",
+    "building": "ALTAJER",
+    "alias": null
+  },
+  "lofts t east": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "LOFTS T EAST",
+    "building": "LOFTS T EAST",
+    "alias": null
+  },
+  "blvd crescent tower 1": {
+    "master": "Downtown Dubai",
+    "district": "BLVD CRESCENT",
+    "project": "BLVD CRESCENT Tower 1",
+    "building": "BLVD CRESCENT Tower 1",
+    "alias": null
+  },
+  "act one act two tower 1": {
+    "master": "Downtown Dubai",
+    "district": "ACT ONE | ACT TWO",
+    "project": "Act One Act Two Tower 1",
+    "building": "Act One Act Two Tower 1",
+    "alias": null
+  },
+  "lofts": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "LOFTS",
+    "building": "LOFTS",
+    "alias": null
+  },
+  "al noujoum tower": {
+    "master": "Downtown Dubai",
+    "district": "BURJ AL NUJOOM",
+    "project": "Al NOUJOUM TOWER",
+    "building": "Al NOUJOUM TOWER",
+    "alias": null
+  },
+  "blvd crescent tower 2": {
+    "master": "Downtown Dubai",
+    "district": "BLVD CRESCENT",
+    "project": "BLVD CRESCENT Tower 2",
+    "building": "BLVD CRESCENT Tower 2",
+    "alias": null
+  },
+  "emaar square building 2": {
+    "master": "Downtown Dubai",
+    "district": "Emaar Square",
+    "project": "Emaar Square Building 2",
+    "building": "Emaar Square Building 2",
+    "alias": null
+  },
+  "upper crest": {
+    "master": "Downtown Dubai",
+    "district": "UPPER CREST",
+    "project": "UPPER CREST",
+    "building": "UPPER CREST",
+    "alias": null
+  },
+  "address fountain views hotel": {
+    "master": "Downtown Dubai",
+    "district": "THE ADDRESS RESIDENCE FOUNTAIN VIEWS III",
+    "project": "Address Fountain Views Hotel",
+    "building": "Address Fountain Views Hotel",
+    "alias": null
+  },
+  "the residences ii - tower 1": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "THE RESIDENCES II - TOWER 1",
+    "building": "THE RESIDENCES II - TOWER 1",
+    "alias": null
+  },
+  "the distinction": {
+    "master": "Downtown Dubai",
+    "district": "THE DISTINCTION",
+    "project": "THE DISTINCTION",
+    "building": "THE DISTINCTION",
+    "alias": null
+  },
+  "forte t2": {
+    "master": "Downtown Dubai",
+    "district": "FORTE",
+    "project": "Forte T2",
+    "building": "Forte T2",
+    "alias": null
+  },
+  "residences_e1": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "Residences_E1",
+    "building": "Residences_E1",
+    "alias": null
+  },
+  "lofts t cent": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "LOFTS T CENT",
+    "building": "LOFTS T CENT",
+    "alias": null
+  },
+  "act one act two tower 2": {
+    "master": "Downtown Dubai",
+    "district": "ACT ONE | ACT TWO",
+    "project": "Act One Act Two Tower 2",
+    "building": "Act One Act Two Tower 2",
+    "alias": null
+  },
+  "burj views tower c": {
+    "master": "Downtown Dubai",
+    "district": "BURJ VIEWS",
+    "project": "Burj Views Tower C",
+    "building": "Burj Views Tower C",
+    "alias": null
+  },
+  "blvd plaza t1": {
+    "master": "Downtown Dubai",
+    "district": "BD BOULEVARD PLAZA",
+    "project": "BLVD PLAZA T1",
+    "building": "BLVD PLAZA T1",
+    "alias": null
+  },
+  "sofitel residences downtown": {
+    "master": "Downtown Dubai",
+    "district": "Sofitel Residences Downtown",
+    "project": "Sofitel Residences Downtown",
+    "building": "Sofitel Residences Downtown",
+    "alias": null
+  },
+  "the 118": {
+    "master": "Downtown Dubai",
+    "district": "THE 118",
+    "project": "THE 118",
+    "building": "THE 118",
+    "alias": null
+  },
+  "mada residences tower": {
+    "master": "Downtown Dubai",
+    "district": "MADA RESIDENCES TOWER",
+    "project": "MADA Residences Tower",
+    "building": "MADA Residences Tower",
+    "alias": null
+  },
+  "residences_w1": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "Residences_W1",
+    "building": "Residences_W1",
+    "alias": null
+  },
+  "bd blvd plaza t2": {
+    "master": "Downtown Dubai",
+    "district": "BD BOULEVARD PLAZA",
+    "project": "BD BLVD Plaza T2",
+    "building": "BD BLVD Plaza T2",
+    "alias": null
+  },
+  "address residences sky view 2": {
+    "master": "Downtown Dubai",
+    "district": "THE ADDRESS RESIDENCE - SKY VIEW",
+    "project": "Address Residences Sky View 2",
+    "building": "Address Residences Sky View 2",
+    "alias": null
+  },
+  "rixos financial center road dubai residences": {
+    "master": "Downtown Dubai",
+    "district": "Opulent Residences",
+    "project": "Rixos Financial Center Road Dubai Residences",
+    "building": "Rixos Financial Center Road Dubai Residences",
+    "alias": null
+  },
+  "albahar": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "ALBAHAR",
+    "building": "ALBAHAR",
+    "alias": null
+  },
+  "burj khalifa zone 2b": {
+    "master": "Downtown Dubai",
+    "district": "BURJ KHALIFA TOWERS",
+    "project": "Burj Khalifa Zone 2B",
+    "building": "Burj Khalifa Zone 2B",
+    "alias": null
+  },
+  "emaar square bldg 1": {
+    "master": "Downtown Dubai",
+    "district": null,
+    "project": "Emaar Square Bldg 1",
+    "building": "Emaar Square Bldg 1",
+    "alias": null
+  },
+  "address residences sky view": {
+    "master": "Downtown Dubai",
+    "district": "THE ADDRESS RESIDENCE - SKY VIEW",
+    "project": "Address Residences Sky View",
+    "building": "Address Residences Sky View",
+    "alias": null
+  }
+}

@@ -1,0 +1,5 @@
+21: import requests
+69: resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+72: except requests.RequestException as e:
+111: resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+141: resp = requests.get(url, params=params, headers=HEADERS, timeout=30)

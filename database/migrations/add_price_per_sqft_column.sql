@@ -1,0 +1,2 @@
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS price_per_sqft NUMERIC;
+ALTER TABLE properties ADD COLUMN IF NOT EXISTS price_per_sqft NUMERIC;

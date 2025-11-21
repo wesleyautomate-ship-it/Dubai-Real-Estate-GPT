@@ -1,0 +1,139 @@
+═══════════════════════════════════════════════════════════════════════════════
+  NATIONALITY TRACKING - QUICK START GUIDE
+  Dubai Real Estate Database
+═══════════════════════════════════════════════════════════════════════════════
+
+📋 STEP 1: APPLY MIGRATION
+───────────────────────────────────────────────────────────────────────────────
+1. Go to Supabase Dashboard → SQL Editor
+2. Open: database/migrations/add_nationality_columns.sql
+3. Copy entire file contents
+4. Paste in SQL Editor and click RUN
+5. Wait for completion (creates tables, views, functions)
+
+✅ VERIFY: Run in PowerShell:
+   python manage_nationalities.py list
+
+═══════════════════════════════════════════════════════════════════════════════
+📝 STEP 2: POPULATE NATIONALITIES
+═══════════════════════════════════════════════════════════════════════════════
+
+METHOD 1: Single Owner Update
+───────────────────────────────────────────────────────────────────────────────
+python manage_nationalities.py update "OWNER NAME" UAE
+
+Examples:
+  python manage_nationalities.py update "MOHAMMED AHMED" UAE
+  python manage_nationalities.py update "RAJESH KUMAR" IND
+  python manage_nationalities.py update "JOHN SMITH" GBR
+
+METHOD 2: Bulk Update (Recommended)
+───────────────────────────────────────────────────────────────────────────────
+1. Create CSV file (use nationalities_template.csv as guide):
+   
+   buyer_name,nationality_code
+   "OWNER NAME 1",UAE
+   "OWNER NAME 2",IND
+   "OWNER NAME 3",GBR
+
+2. Run bulk import:
+   python manage_nationalities.py bulk your_file.csv
+
+═══════════════════════════════════════════════════════════════════════════════
+🔍 STEP 3: SEARCH & ANALYZE
+═══════════════════════════════════════════════════════════════════════════════
+
+Search by Nationality:
+───────────────────────────────────────────────────────────────────────────────
+python manage_nationalities.py search UAE
+python manage_nationalities.py search IND
+python manage_nationalities.py search GBR
+
+View Statistics:
+───────────────────────────────────────────────────────────────────────────────
+python manage_nationalities.py stats
+
+Show Unclassified Owners:
+───────────────────────────────────────────────────────────────────────────────
+python manage_nationalities.py unclassified
+
+═══════════════════════════════════════════════════════════════════════════════
+🌍 COMMON NATIONALITY CODES
+═══════════════════════════════════════════════════════════════════════════════
+
+GCC:          UAE, SAU, QAT, KWT, OMN, BHR
+South Asia:   IND, PAK, BGD, LKA
+Europe:       GBR, FRA, DEU, ITA, ESP, RUS
+East Asia:    CHN, JPN, KOR, SGP
+North America: USA, CAN
+Middle East:  EGY, LBN, JOR, IRN, IRQ, TUR
+Other:        AUS, ZAF, BRA, NGA
+
+Full list: python manage_nationalities.py list
+
+═══════════════════════════════════════════════════════════════════════════════
+💡 TIPS FOR IDENTIFYING NATIONALITIES
+═══════════════════════════════════════════════════════════════════════════════
+
+By Name Patterns:
+  • UAE:   MOHAMMED, AHMED, FATIMA, SULTAN, RASHID, AL MAKTOUM
+  • India: KUMAR, PATEL, SHARMA, SINGH, RAO, GUPTA
+  • Pakistan: KHAN, ALI, HUSSAIN, MALIK, AHMED
+  • UK:    SMITH, JONES, WILLIAMS, BROWN, TAYLOR
+  • China: WANG, LI, ZHANG, LIU, CHEN
+
+By Phone Prefix:
+  • +971-50/55/56 → UAE mobile
+  • +91 → India
+  • +92 → Pakistan  
+  • +44 → United Kingdom
+  • +86 → China
+  • +1 → USA/Canada
+
+═══════════════════════════════════════════════════════════════════════════════
+🎯 USING IN CHAT INTERFACE
+═══════════════════════════════════════════════════════════════════════════════
+
+Once populated, users can ask:
+  • "Show me all Indian owners"
+  • "Properties owned by UAE nationals"
+  • "List British investors in Dubai Marina"
+  • "Find Chinese property owners"
+
+═══════════════════════════════════════════════════════════════════════════════
+⚡ QUICK COMMANDS REFERENCE
+═══════════════════════════════════════════════════════════════════════════════
+
+python manage_nationalities.py list          → List all nationalities
+python manage_nationalities.py update NAME CODE → Update one owner
+python manage_nationalities.py bulk FILE.csv   → Bulk update from CSV
+python manage_nationalities.py search CODE     → Search by nationality
+python manage_nationalities.py stats          → View statistics
+python manage_nationalities.py unclassified   → Show owners without nationality
+
+═══════════════════════════════════════════════════════════════════════════════
+📊 DATABASE QUERIES (Direct SQL)
+═══════════════════════════════════════════════════════════════════════════════
+
+Search by nationality:
+  SELECT * FROM search_by_nationality('UAE', 50);
+
+View stats:
+  SELECT * FROM v_nationality_stats WHERE transaction_count > 0;
+
+Current owners with nationality:
+  SELECT * FROM v_current_owner WHERE owner_nationality = 'IND';
+
+═══════════════════════════════════════════════════════════════════════════════
+📁 FILES CREATED
+═══════════════════════════════════════════════════════════════════════════════
+
+✓ database/migrations/add_nationality_columns.sql   → SQL migration
+✓ manage_nationalities.py                           → Management script
+✓ nationalities_template.csv                        → CSV template
+✓ NATIONALITY_SETUP.md                              → Full documentation
+✓ NATIONALITY_QUICKSTART.txt                        → This file
+
+═══════════════════════════════════════════════════════════════════════════════
+
+For detailed documentation, see: NATIONALITY_SETUP.md

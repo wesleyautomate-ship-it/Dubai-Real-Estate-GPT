@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Create db_stats Function - Setup Instructions</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 900px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #3ecf8e;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .step {
+            background: #f8f9fa;
+            border-left: 4px solid #3ecf8e;
+            padding: 15px 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+        .step h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        .sql-code {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            line-height: 1.5;
+            margin: 15px 0;
+        }
+        .copy-button {
+            background: #3ecf8e;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-top: 10px;
+            transition: background 0.2s;
+        }
+        .copy-button:hover {
+            background: #2eb574;
+        }
+        .copy-button:active {
+            background: #27a066;
+        }
+        .success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+            padding: 12px;
+            border-radius: 4px;
+            margin: 10px 0;
+            display: none;
+        }
+        a {
+            color: #3ecf8e;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+        .warning {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+            padding: 12px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 Setup db_stats Function</h1>
+        <p class="subtitle">Follow these steps to fix the database health check error</p>
+
+        <div class="step">
+            <h3>Step 1: Access Supabase SQL Editor</h3>
+            <p>Go to your Supabase project dashboard and click on the <strong>SQL Editor</strong> in the left sidebar.</p>
+            <p><a href="https://supabase.com/dashboard/project/ggevgecnnmcznurxhplu/sql/new" target="_blank">
+                👉 Open SQL Editor for your project
+            </a></p>
+        </div>
+
+        <div class="step">
+            <h3>Step 2: Copy the SQL Code</h3>
+            <p>Click the button below to copy the SQL code to your clipboard:</p>
+            
+            <button class="copy-button" onclick="copySQL()">📋 Copy SQL Code</button>
+            <div class="success" id="copySuccess">✅ Copied to clipboard!</div>
+            
+            <div class="sql-code" id="sqlCode">-- ============================================================
+-- DATABASE STATS FUNCTION FOR HEALTH CHECKS
+-- ============================================================
+-- Returns general database statistics including property counts
+-- and embedding coverage
+
+CREATE OR REPLACE FUNCTION db_stats()
+RETURNS TABLE (
+    property_count BIGINT,
+    transaction_count BIGINT,
+    owner_count BIGINT,
+    avg_price_per_sqft NUMERIC,
+    chunks_count BIGINT,
+    properties_with_embeddings BIGINT,
+    chunks_with_embeddings BIGINT,
+    last_update TIMESTAMPTZ
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        (SELECT COUNT(*) FROM properties)::BIGINT as property_count,
+        (SELECT COUNT(*) FROM transactions)::BIGINT as transaction_count,
+        (SELECT COUNT(*) FROM owners)::BIGINT as owner_count,
+        ROUND(
+            (SELECT AVG(price / NULLIF(size_sqft, 0)) 
+             FROM transactions 
+             WHERE price > 0 AND size_sqft > 0), 2
+        ) as avg_price_per_sqft,
+        CASE
+            WHEN to_regclass('public.chunks') IS NOT NULL THEN
+                (SELECT COUNT(*) FROM chunks)
+            WHEN to_regclass('public.property_chunks') IS NOT NULL THEN
+                (SELECT COUNT(*) FROM property_chunks)
+            ELSE 0
+        END::BIGINT as chunks_count,
+        CASE
+            WHEN to_regclass('public.chunks') IS NOT NULL THEN
+                (SELECT COUNT(DISTINCT property_id) FROM chunks WHERE embedding IS NOT NULL)
+            WHEN to_regclass('public.property_chunks') IS NOT NULL THEN
+                (SELECT COUNT(DISTINCT property_id) FROM property_chunks WHERE embedding IS NOT NULL)
+            ELSE
+                (
+                    SELECT COUNT(*)
+                    FROM properties
+                    WHERE description_embedding IS NOT NULL OR image_embedding IS NOT NULL
+                )
+        END::BIGINT as properties_with_embeddings,
+        CASE
+            WHEN to_regclass('public.chunks') IS NOT NULL THEN
+                (SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL)
+            WHEN to_regclass('public.property_chunks') IS NOT NULL THEN
+                (SELECT COUNT(*) FROM property_chunks WHERE embedding IS NOT NULL)
+            ELSE 0
+        END::BIGINT as chunks_with_embeddings,
+        CASE
+            WHEN to_regclass('public.chunks') IS NOT NULL THEN
+                (SELECT MAX(created_at) FROM chunks WHERE embedding IS NOT NULL)
+            WHEN to_regclass('public.property_chunks') IS NOT NULL THEN
+                (SELECT MAX(created_at) FROM property_chunks WHERE embedding IS NOT NULL)
+            ELSE
+                (SELECT MAX(embedding_generated_at) FROM properties WHERE embedding_generated_at IS NOT NULL)
+        END as last_update;
+END;
+$$ LANGUAGE plpgsql;</div>
+        </div>
+
+        <div class="step">
+            <h3>Step 3: Paste and Run</h3>
+            <p>1. Paste the SQL code into the Supabase SQL Editor</p>
+            <p>2. Click the <strong>"RUN"</strong> button or press <kbd>Ctrl+Enter</kbd> (Windows) or <kbd>Cmd+Enter</kbd> (Mac)</p>
+            <p>3. You should see a success message</p>
+        </div>
+
+        <div class="step">
+            <h3>Step 4: Test Your Server</h3>
+            <p>After running the SQL, go back to your terminal and start the server:</p>
+            <div class="sql-code">python run_server.py</div>
+            <p>The health check error should be resolved! ✅</p>
+        </div>
+
+        <div class="warning">
+            <strong>⚠️ Note:</strong> If you see an error about <code>property_chunks</code> table not existing, 
+            that's okay! The function will still work for basic stats. The embeddings features can be added later.
+        </div>
+    </div>
+
+    <script>
+        function copySQL() {
+            const sqlText = document.getElementById('sqlCode').textContent;
+            navigator.clipboard.writeText(sqlText).then(() => {
+                const successMsg = document.getElementById('copySuccess');
+                successMsg.style.display = 'block';
+                setTimeout(() => {
+                    successMsg.style.display = 'none';
+                }, 3000);
+            });
+        }
+    </script>
+</body>
+</html>

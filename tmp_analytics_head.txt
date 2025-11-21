@@ -1,0 +1,200 @@
+0002: """
+0003: Analytics Engine: The "Brain" of the Thinking Market Engine
+0004: 
+0005: Provides statistical, temporal, and market intelligence functions.
+0006: Uses DuckDB for fast in-memory analytics on Supabase data.
+0007: 
+0008: Skills:
+0009: - Statistical reasoning (avg, median, percentiles, growth rates)
+0010: - Temporal pattern recognition (trends, seasonality, YoY)
+0011: - Ownership analysis (portfolios, concentration, diversity)
+0012: - Comparable analysis (comps engine with regression)
+0013: - Market correlation (community price movements)
+0014: - Prospecting intelligence (likely sellers, hold duration)
+0015: """
+0016: 
+0017: import asyncio
+0018: import os
+0019: import time
+0020: from datetime import datetime, timedelta
+0021: from typing import Dict, List, Optional, Tuple
+0022: 
+0023: import duckdb
+0024: import pandas as pd
+0025: from scipy import stats
+0026: from backend.supabase_client import select
+0027: from backend.utils.phone_utils import normalize_phone
+0028: 
+0029: class AnalyticsEngine:
+0030:     """Market intelligence and analytical compute engine."""
+0031:     
+0032:     def __init__(self):
+0033:         self.db = duckdb.connect(":memory:")
+0034:         self._cache = {}
+0035: 
+0036:     def _fetch_page(
+0037:         self,
+0038:         table: str,
+0039:         select_fields: str,
+0040:         filters: Optional[Dict] = None,
+0041:         limit: int = 1000,
+0042:         offset: int = 0,
+0043:         order: Optional[str] = None,
+0044:         max_retries: int = 3
+0045:     ) -> List[Dict]:
+0046:         for attempt in range(max_retries):
+0047:             try:
+0048:                 return asyncio.run(
+0049:                     select(
+0050:                         table,
+0051:                         select_fields=select_fields,
+0052:                         filters=filters,
+0053:                         limit=limit,
+0054:                         offset=offset,
+0055:                         order=order
+0056:                     )
+0057:                 )
+0058:             except Exception as exc:
+0059:                 if attempt == max_retries - 1:
+0060:                     raise
+0061:                 wait_time = 2 ** attempt
+0062:                 print(f"Retry {attempt + 1}/{max_retries} after {wait_time}s...")
+0063:                 time.sleep(wait_time)
+0064:         return []
+0065:     
+0066:     def fetch_transactions(self, filters: Optional[Dict] = None, max_retries: int = 3) -> pd.DataFrame:
+0067:         """Fetch transactions from Supabase with pagination and retry logic."""
+0068:         url = f"{SUPABASE_URL}/rest/v1/transactions"
+0069:         all_data = []
+0070:         offset = 0
+0071:         page_size = 1000
+0072:         
+0073:         while True:
+0074:             params = {
+0075:                 "select": "community,building,unit,property_type,size_sqft,price,transaction_date,buyer_name,seller_name,buyer_phone,seller_phone,bedrooms",
+0076:                 "limit": str(page_size),
+0077:                 "offset": str(offset)
+0078:             }
+0079:             
+0080:             # Apply filters without overwriting keys
+0081:             if filters:
+0082:                 for key, value in filters.items():
+0083:                     if key in params:
+0084:                         # For duplicate keys, append to list
+0085:                         if not isinstance(params[key], list):
+0086:                             params[key] = [params[key]]
+0087:                         params[key].append(value)
+0088:                     else:
+0089:                         params[key] = value
+0090:             
+0091:             # Retry logic with exponential backoff
+0092:             for attempt in range(max_retries):
+0093:                 try:
+0094:                     resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+0095:                     resp.raise_for_status()
+0096:                     break
+0097:                 except requests.RequestException as e:
+0098:                     if attempt == max_retries - 1:
+0099:                         raise
+0100:                     wait_time = 2 ** attempt
+0101:                     print(f"Retry {attempt + 1}/{max_retries} after {wait_time}s...")
+0102:                     time.sleep(wait_time)
+0103:             
+0104:             page_data = resp.json()
+0105:             
+0106:             if not page_data:
+0107:                 break
+0108:             
+0109:             all_data.extend(page_data)
+0110:             
+0111:             # If we got less than page_size, we're done
+0112:             if len(page_data) < page_size:
+0113:                 break
+0114:             
+0115:             offset += page_size
+0116:         
+0117:         df = pd.DataFrame(all_data)
+0118:         if not df.empty and 'transaction_date' in df.columns:
+0119:             df['transaction_date'] = pd.to_datetime(df['transaction_date'])
+0120:         return df
+0121:     
+0122:     def fetch_owners(self) -> pd.DataFrame:
+0123:         """Fetch owners with cluster info (paginated)."""
+0124:         url = f"{SUPABASE_URL}/rest/v1/owners"
+0125:         all_data = []
+0126:         offset = 0
+0127:         page_size = 1000
+0128:         
+0129:         while True:
+0130:             params = {
+0131:                 "select": "id,raw_name,raw_phone,norm_name,norm_phone,cluster_id",
+0132:                 "limit": str(page_size),
+0133:                 "offset": str(offset)
+0134:             }
+0135:             
+0136:             resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+0137:             resp.raise_for_status()
+0138:             page_data = resp.json()
+0139:             
+0140:             if not page_data:
+0141:                 break
+0142:             
+0143:             all_data.extend(page_data)
+0144:             
+0145:             if len(page_data) < page_size:
+0146:                 break
+0147:             
+0148:             offset += page_size
+0149:         
+0150:         return pd.DataFrame(all_data)
+0151:     
+0152:     def fetch_properties(self) -> pd.DataFrame:
+0153:         """Fetch properties (paginated)."""
+0154:         url = f"{SUPABASE_URL}/rest/v1/properties"
+0155:         all_data = []
+0156:         offset = 0
+0157:         page_size = 1000
+0158:         
+0159:         while True:
+0160:             params = {
+0161:                 "select": "*",
+0162:                 "limit": str(page_size),
+0163:                 "offset": str(offset)
+0164:             }
+0165:             
+0166:             resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+0167:             resp.raise_for_status()
+0168:             page_data = resp.json()
+0169:             
+0170:             if not page_data:
+0171:                 break
+0172:             
+0173:             all_data.extend(page_data)
+0174:             
+0175:             if len(page_data) < page_size:
+0176:                 break
+0177:             
+0178:             offset += page_size
+0179:         
+0180:         return pd.DataFrame(all_data)
+0181:     
+0182:     # ========== SKILL 1: STATISTICAL REASONING ==========
+0183:     
+0184:     def market_stats(self, community: Optional[str] = None, 
+0185:                     start_date: Optional[str] = None,
+0186:                     end_date: Optional[str] = None) -> Dict:
+0187:         """
+0188:         Calculate market statistics.
+0189:         
+0190:         Returns:
+0191:             avg_price, median_price, avg_psf, total_volume, transaction_count
+0192:         """
+0193:         filters = {}
+0194:         if community:
+0195:             filters["community"] = f"ilike.%{community}%"
+0196:         # Use proper Supabase filter syntax for date ranges
+0197:         if start_date and end_date:
+0198:             filters["transaction_date"] = f"gte.{start_date}&transaction_date=lte.{end_date}"
+0199:         elif start_date:
+0200:             filters["transaction_date"] = f"gte.{start_date}"
+0201:         elif end_date:
