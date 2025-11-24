@@ -28,7 +28,7 @@
 ### Quick Command (PowerShell)
 
 ```powershell
-$env:OPENAI_API_KEY = "sk-proj-REPLACE_WITH_YOUR_KEY"
+$env:OPENAI_API_KEY = "your-openai-api-key-here"
 python backend/scripts/generate_embeddings.py
 ```
 
