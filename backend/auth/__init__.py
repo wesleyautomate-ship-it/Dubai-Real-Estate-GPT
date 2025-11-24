@@ -2,7 +2,7 @@
 
 from .models import AuthenticatedUser
 from .jwt import decode_access_token, verify_authorization_header
-from .supabase import send_magic_link, refresh_session
+from .neon import send_magic_link, refresh_session
 
 __all__ = [
     "AuthenticatedUser",

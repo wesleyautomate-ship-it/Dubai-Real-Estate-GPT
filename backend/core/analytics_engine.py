@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Tuple
 import duckdb
 import pandas as pd
 from scipy import stats
-from backend.supabase_client import select
+from backend.neon_client import select
 from backend.utils.phone_utils import normalize_phone
 
 class AnalyticsEngine:

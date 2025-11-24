@@ -1,4 +1,4 @@
-"""Authentication endpoints leveraging Supabase Auth."""
+"""Authentication endpoints leveraging Neon (Supabase-compatible) Auth."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def _parse_expires_at(value: Any) -> Optional[datetime]:
     return None
 
 
-def _map_supabase_user(payload: Dict[str, Any]) -> schemas.AuthUser:
+def _map_neon_user(payload: Dict[str, Any]) -> schemas.AuthUser:
     user_id = payload.get("id") or payload.get("sub")
     if not user_id:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Invalid Supabase user payload")
@@ -109,7 +109,7 @@ async def refresh_auth_session(request: Request, payload: schemas.AuthRefreshReq
     if not isinstance(user_payload, dict):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Supabase refresh missing user")
 
-    user = _map_supabase_user(user_payload)
+    user = _map_neon_user(user_payload)
 
     response = schemas.AuthSessionResponse(
         access_token=access_token,

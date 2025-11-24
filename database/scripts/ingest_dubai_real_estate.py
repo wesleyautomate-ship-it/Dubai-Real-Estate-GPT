@@ -2,7 +2,7 @@
 Community-by-community ingestion pipeline for the revamped schema.
 
 Usage:
-    python database/scripts/ingest_dubai_real_estate.py --files "downtown latest data"
+python database/scripts/ingest_dubai_real_estate.py --files "downtown latest data"
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Iterable
 
 import json
+
+from ai_enrichment import ai_enrich_records
 
 import pandas as pd
 import psycopg2
@@ -123,6 +125,31 @@ def canonicalize_master_community(source: Optional[str], filename: Optional[str]
     return candidate
 
 
+def chunk_records(records: List[Dict[str, object]], size: int) -> Iterable[List[Dict[str, object]]]:
+    """Yield consecutive slices of records of at most `size`."""
+    if size <= 0:
+        yield records
+        return
+    for start in range(0, len(records), size):
+        yield records[start:start + size]
+
+
+def log_environment_status() -> None:
+    """Log which environment variables are available before ingestion."""
+    missing = []
+    if not os.getenv("NEON_DB_URL") and not os.getenv("SUPABASE_DB_URL"):
+        missing.append("NEON_DB_URL/SUPABASE_DB_URL")
+
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key:
+        print("Gemini API key detected; AI enrichment will be enabled.")
+    else:
+        print("Warning: GEMINI_API_KEY is missing. AI enrichment will be skipped.")
+
+    if missing:
+        print("Warning: the following expected credentials are not configured:", ", ".join(missing))
+
+
 def infer_bedrooms(raw_value: Optional[object], property_type: Optional[str]) -> Tuple[Optional[float], str, Optional[float]]:
     """
     Returns (bedrooms, source, confidence).
@@ -175,10 +202,8 @@ class NeonDB:
     dsn: str
 
     def __post_init__(self) -> None:
-        self.conn = psycopg2.connect(self.dsn, cursor_factory=RealDictCursor)
-        self.conn.autocommit = False
-        with self.conn.cursor() as cur:
-            cur.execute("SET statement_timeout TO 0")
+        self._dsn = self._sanitize_dsn(self.dsn)
+        self.conn = self._connect()
         print("Connected to Neon database.")
         self.community_cache: Dict[str, int] = {}
         self.district_cache: Dict[Tuple[int, str], int] = {}
@@ -188,13 +213,50 @@ class NeonDB:
         self.owner_cache: Dict[str, int] = {}
         self.contact_cache: set[Tuple[int, str]] = set()
 
+    def _connect(self):
+        conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            cur.execute("SET statement_timeout TO 0")
+        return conn
+
+    @staticmethod
+    def _sanitize_dsn(dsn: str) -> str:
+        """
+        Normalize the DSN for drivers that do not support channel binding or explicit SSL flags.
+        Strips channel_binding and ensures sslmode=require is present.
+        """
+        from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+
+        parsed = urlparse(dsn)
+        if not parsed.scheme.startswith("postgres"):
+            updated = dsn.replace("channel_binding=require", "")
+            if "sslmode=" not in updated:
+                separator = "&" if "?" in updated else "?"
+                updated = f"{updated}{separator}sslmode=require"
+            return updated
+
+        query_params = {k: v for k, v in parse_qsl(parsed.query) if k != "channel_binding"}
+        query_params.setdefault("sslmode", "require")
+        sanitized_query = urlencode(query_params)
+        sanitized = urlunparse(parsed._replace(query=sanitized_query))
+        return sanitized
+
+    def _ensure_connection(self) -> None:
+        """Reconnect if the session was dropped (e.g., after long idle AI calls)."""
+        if not self.conn or self.conn.closed:
+            print("Reconnecting to Neon database...")
+            self.conn = self._connect()
+
     def close(self) -> None:
-        self.conn.close()
+        if getattr(self, "conn", None) and not self.conn.closed:
+            self.conn.close()
 
     # ------------------------------------------------------------------
     # UPSERT HELPERS
     # ------------------------------------------------------------------
     def _upsert(self, table: str, data: Dict[str, object], conflict_cols: Sequence[str]) -> int:
+        self._ensure_connection()
         columns = list(data.keys())
         values = [data[c] for c in columns]
         insert_stmt = sql.SQL(
@@ -219,6 +281,7 @@ class NeonDB:
             return int(row["id"])
 
     def ensure_communities_bulk(self, names: Sequence[Optional[str]]) -> Dict[str, int]:
+        self._ensure_connection()
         names_set = sorted({n for n in names if n})
         if not names_set:
             return {}
@@ -237,7 +300,73 @@ class NeonDB:
             self.community_cache.update(mapping)
             return mapping
 
+    def ensure_building_aliases(self, aliases: Sequence[Tuple[int, str]]) -> None:
+        self._ensure_connection()
+        """Ensure building_alias records exist for the given (building_id, alias) pairs.
+
+        This performs a bulk insert with ON CONFLICT DO NOTHING using the
+        building_aliases (building_id, alias) unique constraint.
+        """
+        if not aliases:
+            return
+
+        # Normalize and deduplicate aliases
+        dedup: Dict[Tuple[int, str], Tuple[int, str]] = {}
+        for building_id, alias in aliases:
+            if not building_id or not alias:
+                continue
+            key = (int(building_id), alias.strip())
+            dedup[key] = key
+
+        if not dedup:
+            return
+
+        existing_ids = self._existing_building_ids([building_id for building_id, _ in dedup.keys()])
+        if not existing_ids:
+            return
+
+        values: List[Tuple[int, str]] = []
+        skipped = []
+        for building_id, alias in dedup.values():
+            if building_id in existing_ids:
+                values.append((building_id, alias))
+            else:
+                skipped.append((building_id, alias))
+
+        if skipped:
+            print(
+                f"Warning: Skipping {len(skipped)} building_alias entries because "
+                "building_id is not present in buildings table."
+            )
+
+        if not values:
+            return
+
+        with self.conn.cursor() as cur:
+            execute_values(
+                cur,
+                """
+                INSERT INTO building_aliases (building_id, alias)
+                VALUES %s
+                ON CONFLICT (building_id, alias) DO NOTHING
+                """,
+                values,
+            )
+
+    def _existing_building_ids(self, building_ids: Sequence[int]) -> set[int]:
+        self._ensure_connection()
+        unique_ids = {int(bid) for bid in building_ids if bid}
+        if not unique_ids:
+            return set()
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM buildings WHERE id = ANY(%s)",
+                (list(unique_ids),),
+            )
+            return {row["id"] for row in cur.fetchall()}
+
     def ensure_districts_bulk(self, entries: Sequence[Tuple[int, Optional[str]]]) -> Dict[Tuple[int, str], int]:
+        self._ensure_connection()
         dedup: set[Tuple[int, str]] = set()
         for community_id, raw_name in entries:
             if not community_id:
@@ -280,6 +409,7 @@ class NeonDB:
         self,
         entries: Sequence[Tuple[int, Optional[int], str]],
     ) -> Dict[Tuple[int, Optional[int], str], int]:
+        self._ensure_connection()
         dedup: set[Tuple[int, Optional[int], str]] = set()
         for community_id, district_id, raw_name in entries:
             if not community_id:
@@ -319,6 +449,7 @@ class NeonDB:
             return mapping
 
     def ensure_clusters_bulk(self, entries: Sequence[Tuple[int, str]]) -> Dict[Tuple[int, str], int]:
+        self._ensure_connection()
         dedup: set[Tuple[int, str]] = set()
         for project_id, raw_name in entries:
             if not project_id:
@@ -361,6 +492,7 @@ class NeonDB:
         self,
         entries: Sequence[Tuple[int, Optional[int], str, Optional[str]]],
     ) -> Dict[Tuple[int, str], int]:
+        self._ensure_connection()
         dedup_map: Dict[Tuple[int, str], Tuple[Optional[int], Optional[str]]] = {}
         for proj, cluster, name, alias in entries:
             if not proj:
@@ -405,6 +537,7 @@ class NeonDB:
         """
         owner_data: {norm_name: {'name': raw_name, 'nationality': ..., 'birth_date': ...}}
         """
+        self._ensure_connection()
         if not owner_data:
             return {}
             
@@ -473,6 +606,7 @@ class NeonDB:
         return result
 
     def ensure_owner_contacts(self, owner_id: int, phones: Sequence[str]) -> None:
+        self._ensure_connection()
         if not phones:
             return
         values = []
@@ -503,6 +637,7 @@ class NeonDB:
         unit_identifier: Optional[str],
         property_number: Optional[str],
     ) -> Optional[int]:
+        self._ensure_connection()
         with self.conn.cursor() as cur:
             cur.execute(
                 """
@@ -517,6 +652,7 @@ class NeonDB:
         return None
 
     def upsert_property(self, data: Dict[str, object]) -> int:
+        self._ensure_connection()
         property_id = None
         if data.get("building_id") and data.get("unit_identifier"):
             property_id = self.find_property(
@@ -548,6 +684,7 @@ class NeonDB:
             return int(row["id"])
 
     def bulk_upsert_properties(self, rows: List[Tuple], columns: List[str]) -> Dict[Tuple[int, str], int]:
+        self._ensure_connection()
         if not rows:
             return {}
         unique: Dict[Tuple[Optional[int], Optional[str]], Tuple] = {}
@@ -575,11 +712,22 @@ class NeonDB:
             VALUES %s
             ON CONFLICT (building_id, unit_identifier)
             DO UPDATE SET
-                owner_id = EXCLUDED.owner_id,
-                last_transaction_date = EXCLUDED.last_transaction_date,
-                purchase_price = EXCLUDED.purchase_price,
+                completion = EXCLUDED.completion,
+                property_type = EXCLUDED.property_type,
+                usage = EXCLUDED.usage,
+                sub_type = EXCLUDED.sub_type,
+                bedrooms = EXCLUDED.bedrooms,
+                bathrooms = EXCLUDED.bathrooms,
+                status = EXCLUDED.status,
                 size_sqm = EXCLUDED.size_sqm,
                 size_sqft = EXCLUDED.size_sqft,
+                built_up_sqm = EXCLUDED.built_up_sqm,
+                built_up_sqft = EXCLUDED.built_up_sqft,
+                plot_size_sqm = EXCLUDED.plot_size_sqm,
+                plot_size_sqft = EXCLUDED.plot_size_sqft,
+                municipality_no = EXCLUDED.municipality_no,
+                municipality_sub_no = EXCLUDED.municipality_sub_no,
+                land_number = EXCLUDED.land_number,
                 updated_at = now()
             RETURNING id, building_id, unit_identifier
             """
@@ -594,6 +742,7 @@ class NeonDB:
         return mapping
 
     def bulk_insert_transactions(self, rows: List[Tuple], columns: List[str]) -> None:
+        self._ensure_connection()
         if not rows:
             return
         template = "(" + ", ".join(["%s"] * len(columns)) + ")"
@@ -607,6 +756,7 @@ class NeonDB:
             execute_values(cur, query.as_string(cur), rows, template=template, page_size=200)
 
     def insert_transaction(self, data: Dict[str, object]) -> int:
+        self._ensure_connection()
         columns = list(data.keys())
         values = [data[c] for c in columns]
         stmt = sql.SQL(
@@ -621,6 +771,7 @@ class NeonDB:
             return int(row["id"])
 
     def commit(self) -> None:
+        self._ensure_connection()
         self.conn.commit()
 
 
@@ -855,6 +1006,16 @@ def ingest_file(db: NeonDB, path: Path, max_rows: Optional[int] = None, skip_row
     else:
         print(f"Normalized {len(records)} rows from {path.name}")
 
+    # ------------------------------------------------------------------
+    # AI ENRICHMENT (optional, non-fatal)
+    # ------------------------------------------------------------------
+    try:
+        records, alias_suggestions = ai_enrich_records(records, db)
+        print(f"AI-enriched {len(records)} records (alias suggestions: {len(alias_suggestions)})")
+    except Exception as exc:
+        alias_suggestions = []
+        print(f"Warning: AI enrichment skipped due to error: {exc}")
+
     community_map = db.ensure_communities_bulk(
         [rec["master_community"] for rec in records]
     )
@@ -895,6 +1056,10 @@ def ingest_file(db: NeonDB, path: Path, max_rows: Optional[int] = None, skip_row
             for rec in records
         ]
     )
+
+    # Persist any high-confidence building alias suggestions from AI enrichment.
+    if alias_suggestions:
+        db.ensure_building_aliases(alias_suggestions)
     owner_data_map = {}
     for rec in records:
         norm = normalize_name(rec["owner_name"]) or rec["owner_name"] or "UNKNOWN"
@@ -934,9 +1099,6 @@ def ingest_file(db: NeonDB, path: Path, max_rows: Optional[int] = None, skip_row
         "bedrooms",
         "bathrooms",
         "status",
-        "owner_id",
-        "last_transaction_date",
-        "purchase_price",
         "size_sqm",
         "size_sqft",
         "built_up_sqm",
@@ -950,19 +1112,19 @@ def ingest_file(db: NeonDB, path: Path, max_rows: Optional[int] = None, skip_row
 
     transaction_columns = [
         "property_id",
-        "transaction_date",
+        "event_date",
         "price",
         "price_per_sqm",
         "price_per_sqft",
         "completion",
         "property_type",
         "usage",
-        "sub_type",
         "bedrooms",
         "bathrooms",
         "actual_size_sqm",
         "actual_size_sqft",
         "buyer_owner_id",
+        "transaction_type",
     ]
 
     for idx, rec in enumerate(records, start=1):
@@ -1004,19 +1166,16 @@ def ingest_file(db: NeonDB, path: Path, max_rows: Optional[int] = None, skip_row
                     rec["sub_type"],
                     rec["bedrooms"],
                     rec["bathrooms"],
-                    "owned",
-                    owner_id,
-                    rec["transaction_date"],
-                    rec["transaction_amount"],
-                    rec["actual_size_sqm"],
-                    rec["actual_size_sqft"],
-                    rec["built_up_sqm"],
-                    rec["built_up_sqft"],
-                    rec["plot_size_sqm"],
-                    rec["plot_size_sqft"],
-                    rec["municipality_no"],
-                    rec["municipality_sub_no"],
-                    rec["land_number"],
+                    rec.get("status") or "owned",
+                    rec.get("actual_size_sqm"),
+                    rec.get("actual_size_sqft"),
+                    rec.get("built_up_sqm"),
+                    rec.get("built_up_sqft"),
+                    rec.get("plot_size_sqm"),
+                    rec.get("plot_size_sqft"),
+                    rec.get("municipality_no"),
+                    rec.get("municipality_sub_no"),
+                    rec.get("land_number"),
                 )
                 property_records[key] = rec
 
@@ -1042,12 +1201,12 @@ def ingest_file(db: NeonDB, path: Path, max_rows: Optional[int] = None, skip_row
                 rec["completion"],
                 rec["property_type"],
                 rec["usage"],
-                rec["sub_type"],
                 rec["bedrooms"],
                 rec["bathrooms"],
                 rec["actual_size_sqm"],
                 rec["actual_size_sqft"],
                 rec["owner_id"],
+                "sale",
             )
         )
 
@@ -1063,6 +1222,7 @@ def ingest_file(db: NeonDB, path: Path, max_rows: Optional[int] = None, skip_row
 
 def main() -> None:
     load_dotenv()
+    log_environment_status()
     parser = argparse.ArgumentParser(description="Ingest Dubai Excel data per community.")
     parser.add_argument(
         "--files",

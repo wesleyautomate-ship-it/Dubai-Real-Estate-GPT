@@ -15,7 +15,7 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 import uuid
 import time
-from backend.supabase_client import call_rpc, select
+from backend.neon_client import call_rpc, select
 from backend.embeddings import embed_text
 from backend.utils.property_query_parser import parse_property_query
 from backend.utils.community_aliases import resolve_community_alias

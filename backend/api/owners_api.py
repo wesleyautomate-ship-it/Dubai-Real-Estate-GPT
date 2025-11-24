@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from backend.supabase_client import call_rpc, select
+from backend.neon_client import call_rpc, select
 from backend.utils.community_aliases import (
     resolve_building_alias,
     resolve_community_alias,

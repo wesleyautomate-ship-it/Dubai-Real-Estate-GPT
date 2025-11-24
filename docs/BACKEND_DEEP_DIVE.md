@@ -1,0 +1,3000 @@
+# Dubai Real Estate Backend Deep Dive
+Last updated: 2025-11-24T15:44:34.764703+00:00
+This file documents the FastAPI backend: routing, orchestration, Neon integration, embeddings, chat tools, and where we need to improve reliability, performance, and quality. It is intentionally long to serve as a single reference for engineering and product teams.
+## Stack and Entry Points
+- Framework: FastAPI with CORSMiddleware, SlowAPI rate limiting, Prometheus instrumentation, optional OpenTelemetry tracing.
+- Entry: `backend/main.py` boots the app, sets up logging, wiring of routers (auth, search, properties, owners, stats, chat, chat_tools, conversations), health checks, and static file serving.
+- Configuration: `backend/settings.py` and `backend/config.py` load env vars (API host/port, Neon keys, LLM provider keys, tracing/metrics toggles).
+- Data access: `backend/neon_client.py` wraps select/insert/update/RPC calls with auth headers and retry knobs.
+- LLM layer: `backend/llm_client.py` talks to Gemini/OpenAI; `backend/core/ai_orchestrator.py` routes prompts and invokes tools.
+- Embeddings: `backend/embeddings.py` computes vectors; `backend/scripts/generate_embeddings.py` bulk processes properties and chunks.
+## Middleware and Observability
+- `request_context_middleware` injects request IDs and logging context.
+- `auth_middleware` enforces service role key or JWT checks on protected endpoints.
+- SlowAPI limiter guards endpoints with IP-based rate limits using `get_remote_address`.
+- Prometheus `Instrumentator` exposes `/metrics` if enabled.
+- Optional OpenTelemetry tracer (`_init_tracer`) uses OTLP exporter when configured.
+- Logging via `backend/logging_config.py` sets structlog JSON/plain modes and log levels per settings.
+## Routers Overview
+- `auth_api.py`: login/token validation and JWT helper endpoints.
+- `search_api.py`: semantic + structured property search; alias resolution; RPC calls to `semantic_search` and filter-based queries.
+- `properties_api.py`: CRUD/read endpoints for properties; fetch by filters or IDs; ties into transactions for context.
+- `owners_api.py`: owner lookup with contacts and portfolio joins; uses property_owners and transactions where present.
+- `stats_api.py`: KPI aggregation endpoints leveraging Neon RPCs like `db_stats`.
+- `chat_endpoint.py` and `chat_tools_api.py`: chat completion + toolcalling; integrates embeddings, RAG tables, and LLM client.
+- `conversations_api.py`: persistence and retrieval of conversations/messages with linked properties/leads.
+## Neon and RPCs
+- `neon_client.py` centralizes REST calls with service role bearer auth; exposes select/insert/update/delete and `call_rpc`.
+- Health checks call `db_stats` RPC and connection ping; errors degrade status in `/health`.
+- RPCs in `database/functions` (semantic_search.sql, search_rpcs.sql, db_stats.sql, fix_rpc_functions_final.sql) drive search and stats.
+- Retry and timeout behavior is minimal; improvements can add exponential backoff and circuit-breaking per endpoint.
+## LLM and Chat Orchestration
+- `backend/llm_client.py` abstracts provider selection (OpenAI vs Gemini) with model naming from settings.
+- `backend/core/ai_orchestrator.py` (RealEstateAI) parses intents, routes to analytics engine or Neon queries, normalizes phone numbers, and enriches responses.
+- Chat tools in `backend/core/tools.py` expose property search, analytics summaries, and alias lookups to the LLM via tool-calling.
+- `backend/core/analytics_engine.py` prepares KPI summaries and aggregation logic for CMA-like responses.
+- Embedding support: `backend/embeddings.py` wraps OpenAI embeddings; downstream search blends vector similarity (properties.description_embedding, chunks.embedding) with filters.
+## Request Lifecycle
+1) Client request hits FastAPI; CORS + limiter applied.
+2) Middleware attaches auth context and logging scope.
+3) Router handler parses/validates payload (Pydantic models in `backend/api/schemas.py`).
+4) Business logic calls Neon RPCs or direct queries via Neon_client; optionally calls LLM.
+5) Responses are normalized; errors mapped through `ApiError` + `error_response` helpers.
+6) Metrics/traces recorded; static files served for frontend build if requested.
+## Endpoint Deep Dives
+Each line maps a route to behavior, dependencies, and notes for troubleshooting or improvement.
+- Endpoint 1: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 1: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 1: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 2: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 2: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 2: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 3: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 3: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 3: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 4: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 4: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 4: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 5: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 5: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 5: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 6: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 6: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 6: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 7: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 7: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 7: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 8: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 8: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 8: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 9: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 9: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 9: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 10: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 10: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 10: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 11: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 11: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 11: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 12: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 12: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 12: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 13: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 13: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 13: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 14: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 14: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 14: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 15: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 15: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 15: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 16: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 16: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 16: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 17: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 17: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 17: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 18: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 18: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 18: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 19: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 19: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 19: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 20: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 20: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 20: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 21: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 21: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 21: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 22: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 22: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 22: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 23: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 23: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 23: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 24: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 24: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 24: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 25: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 25: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 25: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 26: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 26: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 26: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 27: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 27: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 27: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 28: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 28: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 28: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 29: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 29: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 29: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 30: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 30: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 30: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 31: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 31: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 31: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 32: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 32: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 32: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 33: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 33: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 33: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 34: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 34: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 34: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 35: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 35: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 35: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 36: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 36: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 36: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 37: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 37: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 37: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 38: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 38: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 38: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 39: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 39: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 39: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 40: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 40: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 40: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 41: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 41: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 41: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 42: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 42: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 42: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 43: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 43: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 43: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 44: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 44: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 44: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 45: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 45: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 45: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 46: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 46: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 46: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 47: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 47: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 47: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 48: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 48: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 48: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 49: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 49: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 49: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 50: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 50: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 50: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 51: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 51: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 51: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 52: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 52: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 52: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 53: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 53: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 53: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 54: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 54: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 54: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 55: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 55: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 55: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 56: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 56: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 56: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 57: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 57: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 57: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 58: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 58: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 58: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 59: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 59: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 59: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 60: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 60: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 60: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 61: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 61: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 61: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 62: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 62: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 62: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 63: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 63: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 63: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 64: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 64: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 64: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 65: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 65: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 65: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 66: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 66: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 66: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 67: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 67: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 67: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 68: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 68: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 68: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 69: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 69: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 69: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 70: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 70: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 70: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 71: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 71: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 71: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 72: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 72: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 72: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 73: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 73: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 73: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 74: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 74: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 74: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 75: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 75: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 75: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 76: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 76: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 76: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 77: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 77: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 77: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 78: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 78: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 78: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 79: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 79: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 79: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 80: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 80: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 80: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 81: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 81: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 81: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 82: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 82: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 82: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 83: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 83: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 83: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 84: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 84: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 84: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 85: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 85: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 85: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 86: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 86: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 86: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 87: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 87: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 87: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 88: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 88: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 88: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 89: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 89: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 89: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 90: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 90: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 90: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 91: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 91: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 91: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 92: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 92: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 92: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 93: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 93: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 93: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 94: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 94: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 94: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 95: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 95: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 95: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 96: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 96: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 96: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 97: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 97: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 97: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 98: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 98: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 98: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 99: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 99: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 99: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 100: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 100: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 100: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 101: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 101: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 101: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 102: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 102: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 102: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 103: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 103: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 103: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 104: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 104: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 104: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 105: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 105: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 105: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 106: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 106: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 106: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 107: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 107: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 107: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 108: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 108: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 108: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 109: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 109: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 109: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 110: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 110: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 110: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 111: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 111: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 111: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 112: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 112: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 112: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 113: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 113: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 113: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 114: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 114: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 114: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 115: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 115: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 115: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 116: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 116: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 116: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 117: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 117: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 117: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 118: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 118: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 118: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 119: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 119: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 119: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 120: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 120: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 120: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 121: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 121: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 121: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 122: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 122: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 122: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 123: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 123: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 123: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 124: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 124: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 124: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 125: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 125: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 125: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 126: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 126: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 126: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 127: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 127: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 127: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 128: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 128: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 128: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 129: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 129: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 129: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 130: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 130: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 130: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 131: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 131: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 131: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 132: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 132: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 132: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 133: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 133: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 133: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 134: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 134: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 134: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 135: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 135: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 135: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 136: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 136: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 136: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 137: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 137: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 137: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 138: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 138: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 138: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 139: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 139: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 139: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 140: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 140: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 140: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 141: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 141: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 141: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 142: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 142: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 142: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 143: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 143: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 143: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 144: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 144: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 144: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 145: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 145: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 145: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 146: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 146: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 146: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 147: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 147: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 147: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 148: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 148: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 148: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 149: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 149: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 149: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 150: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 150: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 150: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 151: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 151: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 151: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 152: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 152: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 152: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 153: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 153: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 153: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 154: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 154: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 154: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 155: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 155: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 155: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 156: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 156: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 156: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 157: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 157: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 157: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 158: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 158: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 158: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 159: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 159: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 159: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 160: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 160: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 160: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 161: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 161: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 161: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 162: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 162: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 162: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 163: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 163: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 163: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 164: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 164: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 164: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 165: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 165: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 165: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 166: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 166: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 166: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 167: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 167: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 167: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 168: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 168: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 168: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 169: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 169: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 169: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 170: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 170: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 170: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 171: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 171: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 171: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 172: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 172: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 172: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 173: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 173: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 173: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 174: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 174: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 174: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 175: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 175: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 175: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 176: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 176: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 176: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 177: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 177: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 177: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 178: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 178: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 178: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 179: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 179: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 179: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 180: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 180: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 180: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 181: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 181: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 181: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 182: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 182: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 182: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 183: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 183: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 183: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 184: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 184: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 184: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 185: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 185: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 185: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 186: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 186: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 186: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 187: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 187: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 187: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 188: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 188: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 188: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 189: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 189: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 189: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 190: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 190: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 190: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 191: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 191: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 191: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 192: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 192: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 192: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 193: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 193: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 193: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 194: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 194: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 194: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 195: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 195: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 195: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 196: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 196: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 196: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 197: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 197: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 197: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 198: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 198: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 198: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 199: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 199: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 199: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 200: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 200: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 200: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 201: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 201: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 201: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 202: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 202: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 202: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 203: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 203: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 203: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 204: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 204: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 204: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 205: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 205: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 205: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 206: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 206: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 206: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 207: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 207: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 207: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 208: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 208: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 208: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 209: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 209: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 209: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 210: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 210: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 210: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 211: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 211: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 211: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 212: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 212: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 212: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 213: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 213: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 213: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 214: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 214: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 214: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 215: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 215: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 215: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 216: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 216: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 216: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 217: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 217: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 217: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 218: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 218: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 218: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 219: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 219: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 219: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 220: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 220: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 220: consider compress responses with gzip/brotli to raise reliability for /metrics.
+- Endpoint 221: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 221: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 221: consider add circuit breaker around Neon to raise reliability for /api/search.
+- Endpoint 222: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 222: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 222: consider cache Neon reads with ETags to raise reliability for /api/properties.
+- Endpoint 223: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 223: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 223: consider wrap llm_client with retries and idempotency keys to raise reliability for /api/owners.
+- Endpoint 224: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 224: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 224: consider add request-level tracing spans to raise reliability for /api/stats.
+- Endpoint 225: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 225: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 225: consider enforce stricter Pydantic validation to raise reliability for /api/chat.
+- Endpoint 226: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 226: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 226: consider introduce feature flags for beta tools to raise reliability for /api/chat/tools.
+- Endpoint 227: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 227: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 227: consider add bulk endpoints for batch analytics to raise reliability for /api/conversations.
+- Endpoint 228: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 228: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 228: consider implement pagination consistently to raise reliability for /api/auth.
+- Endpoint 229: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 229: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 229: consider harden auth middleware with role checks to raise reliability for /health.
+- Endpoint 230: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 230: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 230: consider ship synthetic monitoring for critical routes to raise reliability for /metrics.
+- Endpoint 231: /api/search handles happy_path flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 231: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 231: consider add chaos testing for RPC outages to raise reliability for /api/search.
+- Endpoint 232: /api/properties handles validation_error flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 232: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 232: consider document rate limits per route to raise reliability for /api/properties.
+- Endpoint 233: /api/owners handles rpc_failure flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 233: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 233: consider add content filtering for chat outputs to raise reliability for /api/owners.
+- Endpoint 234: /api/stats handles llm_timeout flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 234: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 234: consider upgrade embedding batching to async to raise reliability for /api/stats.
+- Endpoint 235: /api/chat handles rate_limited flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 235: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 235: consider use background tasks for heavy RPCs to raise reliability for /api/chat.
+- Endpoint 236: /api/chat/tools handles auth_missing flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 236: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 236: consider add canary deploy hooks to raise reliability for /api/chat/tools.
+- Endpoint 237: /api/conversations handles cache_hit flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 237: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 237: consider add structured error codes to raise reliability for /api/conversations.
+- Endpoint 238: /api/auth handles cache_miss flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 238: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 238: consider implement SLA dashboards to raise reliability for /api/auth.
+- Endpoint 239: /health handles alias_resolution flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 239: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 239: consider add audit logging for sensitive fields to raise reliability for /health.
+- Endpoint 240: /metrics handles vector_fallback flows; depends on Neon RPCs and settings; ensure proper error translation.
+- Endpoint behavior 240: Validate payloads via schemas, then call Neon_client.call_rpc or select; log timing and include request_id.
+- Endpoint improvement 240: consider compress responses with gzip/brotli to raise reliability for /metrics.
+## Chat Pipeline Steps
+Repeated scenarios for chat orchestration, covering intent parsing, retrieval, tool calls, and generation.
+- Chat step 1: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 1: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 1: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 2: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 2: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 2: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 3: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 3: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 3: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 4: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 4: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 4: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 5: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 5: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 5: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 6: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 6: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 6: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 7: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 7: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 7: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 8: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 8: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 8: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 9: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 9: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 9: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 10: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 10: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 10: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 11: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 11: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 11: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 12: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 12: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 12: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 13: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 13: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 13: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 14: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 14: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 14: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 15: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 15: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 15: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 16: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 16: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 16: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 17: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 17: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 17: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 18: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 18: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 18: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 19: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 19: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 19: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 20: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 20: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 20: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 21: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 21: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 21: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 22: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 22: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 22: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 23: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 23: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 23: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 24: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 24: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 24: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 25: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 25: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 25: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 26: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 26: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 26: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 27: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 27: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 27: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 28: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 28: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 28: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 29: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 29: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 29: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 30: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 30: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 30: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 31: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 31: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 31: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 32: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 32: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 32: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 33: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 33: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 33: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 34: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 34: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 34: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 35: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 35: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 35: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 36: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 36: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 36: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 37: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 37: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 37: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 38: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 38: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 38: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 39: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 39: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 39: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 40: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 40: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 40: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 41: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 41: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 41: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 42: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 42: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 42: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 43: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 43: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 43: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 44: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 44: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 44: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 45: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 45: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 45: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 46: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 46: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 46: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 47: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 47: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 47: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 48: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 48: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 48: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 49: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 49: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 49: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 50: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 50: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 50: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 51: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 51: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 51: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 52: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 52: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 52: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 53: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 53: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 53: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 54: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 54: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 54: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 55: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 55: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 55: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 56: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 56: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 56: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 57: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 57: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 57: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 58: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 58: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 58: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 59: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 59: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 59: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 60: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 60: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 60: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 61: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 61: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 61: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 62: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 62: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 62: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 63: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 63: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 63: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 64: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 64: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 64: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 65: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 65: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 65: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 66: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 66: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 66: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 67: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 67: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 67: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 68: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 68: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 68: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 69: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 69: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 69: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 70: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 70: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 70: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 71: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 71: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 71: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 72: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 72: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 72: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 73: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 73: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 73: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 74: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 74: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 74: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 75: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 75: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 75: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 76: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 76: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 76: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 77: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 77: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 77: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 78: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 78: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 78: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 79: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 79: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 79: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 80: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 80: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 80: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 81: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 81: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 81: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 82: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 82: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 82: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 83: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 83: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 83: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 84: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 84: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 84: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 85: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 85: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 85: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 86: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 86: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 86: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 87: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 87: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 87: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 88: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 88: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 88: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 89: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 89: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 89: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 90: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 90: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 90: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 91: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 91: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 91: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 92: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 92: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 92: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 93: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 93: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 93: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 94: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 94: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 94: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 95: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 95: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 95: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 96: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 96: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 96: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 97: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 97: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 97: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 98: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 98: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 98: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 99: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 99: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 99: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 100: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 100: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 100: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 101: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 101: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 101: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 102: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 102: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 102: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 103: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 103: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 103: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 104: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 104: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 104: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 105: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 105: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 105: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 106: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 106: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 106: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 107: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 107: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 107: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 108: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 108: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 108: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 109: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 109: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 109: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 110: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 110: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 110: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 111: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 111: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 111: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 112: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 112: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 112: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 113: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 113: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 113: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 114: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 114: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 114: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 115: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 115: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 115: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 116: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 116: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 116: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 117: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 117: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 117: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 118: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 118: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 118: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 119: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 119: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 119: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 120: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 120: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 120: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 121: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 121: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 121: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 122: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 122: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 122: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 123: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 123: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 123: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 124: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 124: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 124: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 125: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 125: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 125: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 126: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 126: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 126: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 127: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 127: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 127: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 128: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 128: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 128: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 129: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 129: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 129: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 130: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 130: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 130: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 131: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 131: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 131: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 132: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 132: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 132: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 133: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 133: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 133: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 134: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 134: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 134: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 135: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 135: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 135: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 136: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 136: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 136: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 137: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 137: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 137: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 138: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 138: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 138: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 139: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 139: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 139: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 140: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 140: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 140: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 141: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 141: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 141: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 142: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 142: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 142: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 143: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 143: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 143: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 144: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 144: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 144: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 145: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 145: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 145: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 146: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 146: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 146: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 147: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 147: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 147: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 148: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 148: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 148: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 149: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 149: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 149: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 150: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 150: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 150: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 151: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 151: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 151: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 152: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 152: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 152: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 153: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 153: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 153: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 154: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 154: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 154: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 155: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 155: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 155: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 156: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 156: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 156: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 157: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 157: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 157: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 158: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 158: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 158: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 159: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 159: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 159: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 160: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 160: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 160: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 161: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 161: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 161: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 162: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 162: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 162: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 163: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 163: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 163: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 164: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 164: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 164: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 165: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 165: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 165: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 166: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 166: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 166: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 167: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 167: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 167: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 168: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 168: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 168: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 169: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 169: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 169: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 170: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 170: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 170: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+- Chat step 171: detect intent `valuation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 171: fetch properties + transactions + rag_documents embeddings for `valuation`; compose v_chat_context-like payload.
+- Chat generation 171: call llm_client with tool call outputs; stream response; log tokens and latency for `valuation`.
+- Chat step 172: detect intent `portfolio` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 172: fetch properties + transactions + rag_documents embeddings for `portfolio`; compose v_chat_context-like payload.
+- Chat generation 172: call llm_client with tool call outputs; stream response; log tokens and latency for `portfolio`.
+- Chat step 173: detect intent `lead_followup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 173: fetch properties + transactions + rag_documents embeddings for `lead_followup`; compose v_chat_context-like payload.
+- Chat generation 173: call llm_client with tool call outputs; stream response; log tokens and latency for `lead_followup`.
+- Chat step 174: detect intent `owner_lookup` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 174: fetch properties + transactions + rag_documents embeddings for `owner_lookup`; compose v_chat_context-like payload.
+- Chat generation 174: call llm_client with tool call outputs; stream response; log tokens and latency for `owner_lookup`.
+- Chat step 175: detect intent `market_report` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 175: fetch properties + transactions + rag_documents embeddings for `market_report`; compose v_chat_context-like payload.
+- Chat generation 175: call llm_client with tool call outputs; stream response; log tokens and latency for `market_report`.
+- Chat step 176: detect intent `cma` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 176: fetch properties + transactions + rag_documents embeddings for `cma`; compose v_chat_context-like payload.
+- Chat generation 176: call llm_client with tool call outputs; stream response; log tokens and latency for `cma`.
+- Chat step 177: detect intent `alias_disambiguation` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 177: fetch properties + transactions + rag_documents embeddings for `alias_disambiguation`; compose v_chat_context-like payload.
+- Chat generation 177: call llm_client with tool call outputs; stream response; log tokens and latency for `alias_disambiguation`.
+- Chat step 178: detect intent `neighborhood_summary` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 178: fetch properties + transactions + rag_documents embeddings for `neighborhood_summary`; compose v_chat_context-like payload.
+- Chat generation 178: call llm_client with tool call outputs; stream response; log tokens and latency for `neighborhood_summary`.
+- Chat step 179: detect intent `prospecting` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 179: fetch properties + transactions + rag_documents embeddings for `prospecting`; compose v_chat_context-like payload.
+- Chat generation 179: call llm_client with tool call outputs; stream response; log tokens and latency for `prospecting`.
+- Chat step 180: detect intent `data_quality` via heuristics; parse entities; resolve community/building aliases before querying.
+- Chat retrieval 180: fetch properties + transactions + rag_documents embeddings for `data_quality`; compose v_chat_context-like payload.
+- Chat generation 180: call llm_client with tool call outputs; stream response; log tokens and latency for `data_quality`.
+## Neon Interaction Patterns
+Standard call shapes and failure handling patterns to keep in mind when touching Neon.
+- Neon call 1: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 1: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 1: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 2: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 2: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 2: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 3: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 3: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 3: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 4: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 4: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 4: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 5: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 5: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 5: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 6: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 6: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 6: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 7: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 7: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 7: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 8: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 8: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 8: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 9: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 9: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 9: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 10: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 10: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 10: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 11: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 11: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 11: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 12: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 12: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 12: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 13: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 13: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 13: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 14: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 14: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 14: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 15: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 15: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 15: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 16: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 16: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 16: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 17: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 17: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 17: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 18: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 18: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 18: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 19: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 19: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 19: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 20: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 20: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 20: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 21: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 21: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 21: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 22: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 22: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 22: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 23: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 23: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 23: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 24: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 24: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 24: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 25: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 25: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 25: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 26: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 26: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 26: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 27: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 27: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 27: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 28: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 28: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 28: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 29: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 29: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 29: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 30: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 30: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 30: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 31: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 31: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 31: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 32: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 32: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 32: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 33: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 33: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 33: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 34: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 34: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 34: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 35: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 35: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 35: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 36: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 36: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 36: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 37: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 37: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 37: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 38: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 38: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 38: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 39: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 39: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 39: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 40: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 40: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 40: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 41: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 41: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 41: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 42: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 42: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 42: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 43: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 43: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 43: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 44: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 44: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 44: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 45: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 45: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 45: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 46: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 46: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 46: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 47: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 47: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 47: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 48: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 48: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 48: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 49: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 49: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 49: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 50: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 50: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 50: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 51: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 51: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 51: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 52: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 52: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 52: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 53: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 53: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 53: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 54: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 54: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 54: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 55: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 55: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 55: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 56: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 56: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 56: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 57: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 57: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 57: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 58: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 58: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 58: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 59: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 59: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 59: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 60: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 60: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 60: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 61: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 61: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 61: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 62: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 62: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 62: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 63: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 63: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 63: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 64: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 64: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 64: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 65: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 65: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 65: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 66: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 66: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 66: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 67: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 67: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 67: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 68: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 68: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 68: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 69: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 69: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 69: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 70: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 70: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 70: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 71: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 71: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 71: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 72: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 72: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 72: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 73: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 73: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 73: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 74: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 74: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 74: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 75: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 75: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 75: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 76: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 76: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 76: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 77: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 77: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 77: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 78: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 78: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 78: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 79: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 79: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 79: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 80: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 80: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 80: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 81: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 81: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 81: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 82: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 82: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 82: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 83: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 83: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 83: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 84: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 84: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 84: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 85: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 85: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 85: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 86: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 86: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 86: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 87: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 87: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 87: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 88: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 88: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 88: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 89: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 89: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 89: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 90: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 90: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 90: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 91: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 91: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 91: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 92: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 92: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 92: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 93: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 93: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 93: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 94: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 94: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 94: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 95: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 95: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 95: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 96: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 96: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 96: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 97: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 97: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 97: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 98: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 98: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 98: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 99: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 99: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 99: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 100: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 100: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 100: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 101: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 101: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 101: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 102: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 102: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 102: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 103: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 103: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 103: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 104: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 104: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 104: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 105: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 105: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 105: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 106: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 106: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 106: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 107: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 107: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 107: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 108: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 108: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 108: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 109: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 109: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 109: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 110: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 110: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 110: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 111: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 111: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 111: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 112: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 112: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 112: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 113: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 113: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 113: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 114: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 114: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 114: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 115: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 115: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 115: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 116: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 116: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 116: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 117: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 117: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 117: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 118: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 118: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 118: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 119: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 119: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 119: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 120: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 120: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 120: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 121: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 121: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 121: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 122: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 122: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 122: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 123: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 123: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 123: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 124: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 124: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 124: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 125: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 125: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 125: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 126: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 126: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 126: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 127: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 127: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 127: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 128: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 128: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 128: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 129: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 129: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 129: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 130: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 130: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 130: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 131: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 131: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 131: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 132: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 132: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 132: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 133: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 133: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 133: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 134: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 134: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 134: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 135: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 135: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 135: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 136: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 136: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 136: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 137: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 137: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 137: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 138: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 138: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 138: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 139: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 139: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 139: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 140: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 140: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 140: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 141: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 141: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 141: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 142: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 142: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 142: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 143: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 143: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 143: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 144: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 144: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 144: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 145: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 145: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 145: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 146: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 146: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 146: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 147: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 147: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 147: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 148: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 148: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 148: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 149: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 149: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 149: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 150: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 150: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 150: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 151: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 151: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 151: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 152: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 152: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 152: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 153: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 153: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 153: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 154: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 154: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 154: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 155: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 155: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 155: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 156: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 156: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 156: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 157: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 157: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 157: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 158: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 158: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 158: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 159: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 159: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 159: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 160: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 160: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 160: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 161: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 161: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 161: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 162: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 162: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 162: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 163: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 163: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 163: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 164: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 164: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 164: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 165: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 165: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 165: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 166: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 166: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 166: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 167: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 167: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 167: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 168: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 168: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 168: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 169: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 169: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 169: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 170: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 170: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 170: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 171: /api/search uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 171: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 171: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 172: /api/properties uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 172: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 172: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 173: /api/owners uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 173: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 173: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 174: /api/stats uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 174: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 174: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 175: /api/chat uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 175: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 175: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 176: /api/chat/tools uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 176: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 176: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 177: /api/conversations uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 177: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 177: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 178: /api/auth uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 178: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 178: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 179: /health uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 179: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 179: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+- Neon call 180: /metrics uses call_rpc with json payload; handle 5xx with retry and fallback messaging.
+- Neon filter 180: use select with filters on community/project/building IDs; prefer server-side pagination to limit payload.
+- Neon error 180: map PostgREST errors to ApiError with detail for client; avoid leaking stack traces.
+## LLM Provider Considerations
+- LLM config 1: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 1: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 1: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 2: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 2: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 2: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 3: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 3: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 3: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 4: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 4: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 4: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 5: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 5: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 5: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 6: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 6: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 6: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 7: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 7: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 7: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 8: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 8: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 8: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 9: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 9: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 9: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 10: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 10: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 10: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 11: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 11: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 11: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 12: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 12: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 12: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 13: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 13: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 13: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 14: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 14: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 14: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 15: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 15: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 15: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 16: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 16: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 16: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 17: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 17: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 17: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 18: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 18: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 18: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 19: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 19: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 19: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 20: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 20: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 20: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 21: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 21: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 21: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 22: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 22: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 22: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 23: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 23: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 23: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 24: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 24: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 24: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 25: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 25: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 25: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 26: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 26: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 26: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 27: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 27: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 27: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 28: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 28: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 28: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 29: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 29: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 29: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 30: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 30: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 30: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 31: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 31: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 31: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 32: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 32: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 32: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 33: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 33: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 33: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 34: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 34: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 34: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 35: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 35: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 35: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 36: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 36: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 36: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 37: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 37: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 37: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 38: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 38: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 38: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 39: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 39: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 39: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 40: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 40: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 40: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 41: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 41: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 41: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 42: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 42: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 42: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 43: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 43: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 43: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 44: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 44: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 44: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 45: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 45: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 45: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 46: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 46: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 46: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 47: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 47: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 47: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 48: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 48: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 48: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 49: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 49: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 49: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 50: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 50: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 50: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 51: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 51: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 51: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 52: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 52: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 52: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 53: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 53: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 53: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 54: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 54: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 54: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 55: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 55: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 55: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 56: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 56: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 56: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 57: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 57: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 57: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 58: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 58: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 58: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 59: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 59: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 59: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 60: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 60: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 60: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 61: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 61: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 61: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 62: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 62: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 62: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 63: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 63: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 63: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 64: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 64: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 64: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 65: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 65: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 65: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 66: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 66: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 66: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 67: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 67: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 67: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 68: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 68: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 68: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 69: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 69: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 69: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 70: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 70: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 70: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 71: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 71: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 71: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 72: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 72: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 72: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 73: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 73: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 73: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 74: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 74: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 74: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 75: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 75: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 75: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 76: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 76: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 76: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 77: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 77: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 77: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 78: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 78: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 78: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 79: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 79: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 79: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 80: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 80: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 80: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 81: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 81: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 81: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 82: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 82: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 82: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 83: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 83: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 83: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 84: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 84: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 84: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 85: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 85: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 85: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 86: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 86: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 86: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 87: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 87: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 87: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 88: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 88: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 88: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 89: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 89: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 89: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 90: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 90: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 90: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 91: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 91: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 91: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 92: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 92: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 92: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 93: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 93: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 93: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 94: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 94: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 94: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 95: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 95: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 95: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 96: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 96: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 96: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 97: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 97: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 97: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 98: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 98: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 98: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 99: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 99: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 99: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 100: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 100: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 100: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 101: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 101: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 101: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 102: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 102: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 102: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 103: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 103: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 103: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 104: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 104: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 104: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 105: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 105: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 105: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 106: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 106: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 106: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 107: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 107: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 107: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 108: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 108: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 108: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 109: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 109: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 109: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 110: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 110: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 110: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 111: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 111: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 111: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 112: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 112: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 112: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 113: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 113: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 113: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 114: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 114: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 114: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 115: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 115: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 115: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 116: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 116: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 116: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 117: provider `openai` with model `gpt-4o-mini` pulled from settings; ensure API key present in health check.
+- LLM timeout 117: enforce per-request timeout and max tokens for `gpt-4o-mini` to cap latency and spend.
+- LLM guardrail 117: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 118: provider `gemini` with model `gpt-4o` pulled from settings; ensure API key present in health check.
+- LLM timeout 118: enforce per-request timeout and max tokens for `gpt-4o` to cap latency and spend.
+- LLM guardrail 118: add content filters and refusal logic when `gemini` returns uncertain outputs.
+- LLM config 119: provider `openai` with model `gemini-1.5-flash` pulled from settings; ensure API key present in health check.
+- LLM timeout 119: enforce per-request timeout and max tokens for `gemini-1.5-flash` to cap latency and spend.
+- LLM guardrail 119: add content filters and refusal logic when `openai` returns uncertain outputs.
+- LLM config 120: provider `gemini` with model `gemini-1.5-pro` pulled from settings; ensure API key present in health check.
+- LLM timeout 120: enforce per-request timeout and max tokens for `gemini-1.5-pro` to cap latency and spend.
+- LLM guardrail 120: add content filters and refusal logic when `gemini` returns uncertain outputs.
+## Authentication and Authorization
+JWT and service-role handling scenarios with improvements for security hardening.
+- Auth case 1: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 1: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 1: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 2: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 2: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 2: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 3: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 3: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 3: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 4: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 4: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 4: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 5: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 5: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 5: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 6: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 6: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 6: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 7: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 7: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 7: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 8: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 8: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 8: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 9: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 9: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 9: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 10: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 10: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 10: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 11: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 11: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 11: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 12: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 12: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 12: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 13: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 13: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 13: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 14: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 14: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 14: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 15: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 15: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 15: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 16: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 16: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 16: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 17: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 17: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 17: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 18: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 18: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 18: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 19: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 19: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 19: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 20: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 20: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 20: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 21: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 21: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 21: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 22: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 22: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 22: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 23: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 23: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 23: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 24: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 24: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 24: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 25: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 25: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 25: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 26: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 26: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 26: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 27: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 27: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 27: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 28: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 28: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 28: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 29: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 29: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 29: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 30: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 30: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 30: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 31: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 31: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 31: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 32: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 32: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 32: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 33: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 33: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 33: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 34: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 34: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 34: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 35: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 35: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 35: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 36: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 36: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 36: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 37: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 37: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 37: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 38: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 38: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 38: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 39: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 39: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 39: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 40: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 40: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 40: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 41: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 41: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 41: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 42: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 42: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 42: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 43: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 43: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 43: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 44: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 44: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 44: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 45: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 45: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 45: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 46: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 46: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 46: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 47: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 47: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 47: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 48: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 48: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 48: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 49: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 49: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 49: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 50: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 50: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 50: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 51: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 51: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 51: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 52: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 52: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 52: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 53: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 53: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 53: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 54: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 54: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 54: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 55: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 55: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 55: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 56: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 56: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 56: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 57: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 57: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 57: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 58: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 58: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 58: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 59: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 59: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 59: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 60: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 60: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 60: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 61: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 61: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 61: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 62: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 62: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 62: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 63: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 63: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 63: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 64: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 64: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 64: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 65: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 65: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 65: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 66: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 66: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 66: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 67: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 67: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 67: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 68: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 68: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 68: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 69: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 69: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 69: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 70: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 70: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 70: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 71: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 71: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 71: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 72: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 72: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 72: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 73: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 73: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 73: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 74: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 74: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 74: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 75: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 75: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 75: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 76: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 76: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 76: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 77: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 77: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 77: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 78: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 78: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 78: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 79: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 79: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 79: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 80: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 80: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 80: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 81: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 81: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 81: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 82: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 82: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 82: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 83: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 83: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 83: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 84: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 84: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 84: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 85: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 85: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 85: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 86: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 86: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 86: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 87: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 87: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 87: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 88: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 88: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 88: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 89: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 89: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 89: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 90: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 90: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 90: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 91: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 91: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 91: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 92: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 92: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 92: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 93: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 93: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 93: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 94: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 94: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 94: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 95: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 95: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 95: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 96: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 96: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 96: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 97: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 97: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 97: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 98: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 98: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 98: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 99: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 99: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 99: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 100: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 100: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 100: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 101: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 101: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 101: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 102: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 102: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 102: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 103: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 103: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 103: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 104: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 104: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 104: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 105: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 105: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 105: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 106: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 106: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 106: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 107: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 107: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 107: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 108: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 108: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 108: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 109: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 109: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 109: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 110: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 110: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 110: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 111: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 111: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 111: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 112: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 112: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 112: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 113: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 113: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 113: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+- Auth case 114: handle `user_jwt` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 114: log auth failures with redaction; consider rate limiting per token for `user_jwt` scenarios.
+- Auth testing 114: add pytest coverage for `user_jwt` in tests/test_api_conversations.py or similar harness.
+- Auth case 115: handle `no_auth` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 115: log auth failures with redaction; consider rate limiting per token for `no_auth` scenarios.
+- Auth testing 115: add pytest coverage for `no_auth` in tests/test_api_conversations.py or similar harness.
+- Auth case 116: handle `expired_token` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 116: log auth failures with redaction; consider rate limiting per token for `expired_token` scenarios.
+- Auth testing 116: add pytest coverage for `expired_token` in tests/test_api_conversations.py or similar harness.
+- Auth case 117: handle `invalid_signature` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 117: log auth failures with redaction; consider rate limiting per token for `invalid_signature` scenarios.
+- Auth testing 117: add pytest coverage for `invalid_signature` in tests/test_api_conversations.py or similar harness.
+- Auth case 118: handle `missing_scope` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 118: log auth failures with redaction; consider rate limiting per token for `missing_scope` scenarios.
+- Auth testing 118: add pytest coverage for `missing_scope` in tests/test_api_conversations.py or similar harness.
+- Auth case 119: handle `mismatched_project` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 119: log auth failures with redaction; consider rate limiting per token for `mismatched_project` scenarios.
+- Auth testing 119: add pytest coverage for `mismatched_project` in tests/test_api_conversations.py or similar harness.
+- Auth case 120: handle `service_role_header` by routing through auth_middleware; return 401/403 with structured error codes.
+- Auth improvement 120: log auth failures with redaction; consider rate limiting per token for `service_role_header` scenarios.
+- Auth testing 120: add pytest coverage for `service_role_header` in tests/test_api_conversations.py or similar harness.
+## Logging, Metrics, and Tracing Lines
+- Observability 1: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 1: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 1: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 2: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 2: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 2: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 3: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 3: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 3: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 4: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 4: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 4: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 5: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 5: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 5: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 6: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 6: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 6: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 7: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 7: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 7: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 8: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 8: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 8: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 9: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 9: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 9: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 10: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 10: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 10: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 11: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 11: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 11: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 12: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 12: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 12: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 13: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 13: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 13: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 14: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 14: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 14: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 15: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 15: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 15: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 16: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 16: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 16: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 17: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 17: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 17: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 18: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 18: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 18: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 19: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 19: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 19: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 20: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 20: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 20: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 21: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 21: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 21: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 22: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 22: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 22: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 23: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 23: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 23: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 24: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 24: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 24: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 25: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 25: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 25: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 26: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 26: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 26: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 27: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 27: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 27: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 28: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 28: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 28: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 29: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 29: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 29: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 30: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 30: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 30: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 31: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 31: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 31: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 32: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 32: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 32: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 33: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 33: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 33: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 34: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 34: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 34: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 35: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 35: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 35: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 36: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 36: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 36: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 37: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 37: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 37: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 38: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 38: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 38: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 39: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 39: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 39: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 40: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 40: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 40: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 41: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 41: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 41: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 42: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 42: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 42: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 43: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 43: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 43: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 44: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 44: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 44: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 45: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 45: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 45: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 46: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 46: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 46: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 47: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 47: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 47: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 48: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 48: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 48: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 49: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 49: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 49: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 50: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 50: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 50: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 51: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 51: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 51: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 52: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 52: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 52: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 53: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 53: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 53: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 54: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 54: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 54: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 55: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 55: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 55: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 56: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 56: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 56: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 57: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 57: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 57: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 58: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 58: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 58: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 59: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 59: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 59: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 60: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 60: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 60: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 61: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 61: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 61: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 62: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 62: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 62: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 63: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 63: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 63: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 64: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 64: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 64: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 65: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 65: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 65: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 66: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 66: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 66: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 67: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 67: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 67: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 68: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 68: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 68: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 69: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 69: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 69: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 70: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 70: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 70: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 71: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 71: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 71: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 72: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 72: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 72: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 73: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 73: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 73: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 74: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 74: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 74: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 75: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 75: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 75: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 76: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 76: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 76: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 77: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 77: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 77: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 78: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 78: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 78: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 79: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 79: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 79: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 80: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 80: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 80: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 81: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 81: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 81: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 82: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 82: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 82: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 83: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 83: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 83: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 84: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 84: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 84: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 85: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 85: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 85: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 86: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 86: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 86: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 87: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 87: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 87: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 88: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 88: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 88: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 89: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 89: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 89: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 90: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 90: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 90: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 91: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 91: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 91: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 92: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 92: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 92: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 93: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 93: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 93: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 94: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 94: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 94: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 95: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 95: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 95: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 96: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 96: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 96: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 97: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 97: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 97: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 98: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 98: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 98: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 99: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 99: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 99: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 100: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 100: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 100: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 101: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 101: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 101: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 102: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 102: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 102: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 103: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 103: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 103: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 104: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 104: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 104: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 105: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 105: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 105: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 106: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 106: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 106: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 107: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 107: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 107: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 108: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 108: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 108: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 109: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 109: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 109: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 110: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 110: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 110: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 111: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 111: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 111: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 112: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 112: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 112: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 113: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 113: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 113: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 114: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 114: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 114: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 115: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 115: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 115: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 116: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 116: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 116: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 117: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 117: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 117: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 118: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 118: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 118: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 119: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 119: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 119: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+- Observability 120: ensure request_id included in logs; instrument RPC calls and LLM calls with durations.
+- Metrics 120: expose counters for endpoint hits and errors; histogram latencies for /api/search and /api/chat.
+- Tracing 120: propagate traceparent into Neon/LLM calls where supported; add span attributes for community/building IDs.
+## Performance and Caching Opportunities
+- Perf 1: cache search responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 1: batch Neon calls for search instead of N+1 selects; use rpc joins where possible.
+- Perf 1: profile search endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 2: cache chat responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 2: batch Neon calls for chat instead of N+1 selects; use rpc joins where possible.
+- Perf 2: profile chat endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 3: cache owners responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 3: batch Neon calls for owners instead of N+1 selects; use rpc joins where possible.
+- Perf 3: profile owners endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 4: cache stats responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 4: batch Neon calls for stats instead of N+1 selects; use rpc joins where possible.
+- Perf 4: profile stats endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 5: cache conversations responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 5: batch Neon calls for conversations instead of N+1 selects; use rpc joins where possible.
+- Perf 5: profile conversations endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 6: cache search responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 6: batch Neon calls for search instead of N+1 selects; use rpc joins where possible.
+- Perf 6: profile search endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 7: cache chat responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 7: batch Neon calls for chat instead of N+1 selects; use rpc joins where possible.
+- Perf 7: profile chat endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 8: cache owners responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 8: batch Neon calls for owners instead of N+1 selects; use rpc joins where possible.
+- Perf 8: profile owners endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 9: cache stats responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 9: batch Neon calls for stats instead of N+1 selects; use rpc joins where possible.
+- Perf 9: profile stats endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 10: cache conversations responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 10: batch Neon calls for conversations instead of N+1 selects; use rpc joins where possible.
+- Perf 10: profile conversations endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 11: cache search responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 11: batch Neon calls for search instead of N+1 selects; use rpc joins where possible.
+- Perf 11: profile search endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 12: cache chat responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 12: batch Neon calls for chat instead of N+1 selects; use rpc joins where possible.
+- Perf 12: profile chat endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 13: cache owners responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 13: batch Neon calls for owners instead of N+1 selects; use rpc joins where possible.
+- Perf 13: profile owners endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 14: cache stats responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 14: batch Neon calls for stats instead of N+1 selects; use rpc joins where possible.
+- Perf 14: profile stats endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 15: cache conversations responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 15: batch Neon calls for conversations instead of N+1 selects; use rpc joins where possible.
+- Perf 15: profile conversations endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 16: cache search responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 16: batch Neon calls for search instead of N+1 selects; use rpc joins where possible.
+- Perf 16: profile search endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 17: cache chat responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 17: batch Neon calls for chat instead of N+1 selects; use rpc joins where possible.
+- Perf 17: profile chat endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 18: cache owners responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 18: batch Neon calls for owners instead of N+1 selects; use rpc joins where possible.
+- Perf 18: profile owners endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 19: cache stats responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 19: batch Neon calls for stats instead of N+1 selects; use rpc joins where possible.
+- Perf 19: profile stats endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 20: cache conversations responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 20: batch Neon calls for conversations instead of N+1 selects; use rpc joins where possible.
+- Perf 20: profile conversations endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 21: cache search responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 21: batch Neon calls for search instead of N+1 selects; use rpc joins where possible.
+- Perf 21: profile search endpoint under load; add indexes or pagination hints to problematic queries.
+- Perf 22: cache chat responses with query-keyed in-memory store when inputs repeat; set short TTLs.
+- Perf 22: batch Neon calls for chat instead of N+1 selects; use rpc joins where possible.
+- Perf 22: profile chat endpoint under load; add indexes or pagination hints to problematic queries.

@@ -1,0 +1,3000 @@
+# Dubai Real Estate Database Deep Dive
+Last updated: 2025-11-24T15:29:41.415778Z
+This document describes how the Dubai Real Estate intelligence application stores, relates, and activates its data. It concentrates on the database structure and how each part of the schema fuels concrete product use cases across ingestion, analytics, semantic search, lead tracking, and chat-driven workflows. The content is intentionally long-form so that every team (engineering, data, product, sales) can point to a single source of truth when reasoning about the platform.
+## Guiding Principles
+- Normalize every property, owner, transaction, and conversation into explicit tables with referential integrity.
+- Keep geospatial, vector, and text search capabilities close to the data to power fast filtering, proximity search, and semantic retrieval.
+- Preserve lineage and confidence so downstream chat answers can cite their sources and qualify uncertainty.
+- Prefer additive migrations (new tables, views, RPCs) over destructive changes to keep ingestion resilient.
+- Build helper views and RPC functions that encapsulate complex joins, letting the backend and chat tools stay thin.
+## Schema Layers At A Glance
+- **Reference & Geography**: communities, districts, projects, clusters, buildings, building_aliases.
+- **Core Facts**: properties, transactions, property_events.
+- **Parties & Relationships**: owners, owner_contacts, property_owners.
+- **Prospecting & Engagement**: leads, lead_actions.
+- **Conversations & Chat**: conversations, conversation_messages.
+- **Retrieval & Vectors**: chunks, rag_documents, rag_prompt_templates, rag_conversations.
+- **Quality & Observability**: data_quality_flags plus indexing strategy and helper views (v_multi_property_owners, v_hot_leads, v_property_hold_duration).
+## Entity Descriptions
+This section walks through every table defined in `database/schema/neon_blueprint.sql` and the lighter Supabase baseline in `database/schema/supabase_schema.sql`. For each entity we note purpose, key columns, and relationships that matter for joins and tools.
+### agents
+Purpose: tracks internal users/agents who verify data, own leads, or author chat responses. Stored as UUIDs for cross-system linking.
+Key columns: id (uuid PK), user_email, full_name, metadata, created_at.
+Relationships: referenced by verification columns across geography, properties, transactions, events, and leads so provenance is auditable.
+### communities
+Purpose: top-level Dubai master communities with optional polygons for spatial queries.
+Key columns: id, name (unique), slug, region, boundary_geom (MultiPolygon, 4326), metadata, source, confidence, verified_by, timestamps.
+Relationships: parent of districts and projects; linked to properties for canonical location anchoring; used in RAG context view.
+### districts
+Purpose: sub-zones within communities with optional boundaries.
+Key columns: id, community_id FK, name, slug, boundary_geom, metadata, source/confidence and audit fields.
+Relationships: parent to projects; cascades on community delete; referenced by properties; indexes on geometry for fast spatial filters.
+### projects
+Purpose: developer-led projects that sit inside communities (and optionally districts).
+Key columns: id, community_id, district_id, name, slug, developer, metadata, source/confidence/audit fields.
+Relationships: parent to clusters and buildings; referenced by properties and views; unique per community/district/name to avoid duplicates.
+### clusters
+Purpose: mid-tier grouping inside a project, useful for large master plans with multiple phases or towers.
+Key columns: id, project_id, name, description, metadata, audit fields.
+Relationships: optional parent to buildings and properties; unique per project/name.
+### buildings
+Purpose: individual towers or structures, optionally located via PostGIS point geometry.
+Key columns: id, project_id, cluster_id, name, tower_name, completion (enum), geom (Point, 4326), height_m, floors, metadata, source/confidence/audit fields.
+Relationships: parent for properties and building_aliases; indexed on geom for proximity queries; unique per project/name to dedupe towers.
+### building_aliases
+Purpose: alternate names for buildings so ingestion and chat can resolve colloquial phrases to canonical records.
+Key columns: id, building_id FK, alias (unique per building).
+Relationships: used in alias resolution tools and search RPCs so vector + keyword search can return the correct building.
+### owners
+Purpose: normalized parties (person/company/bank/government) owning or buying properties.
+Key columns: id, external_owner_id (uuid), name, owner_type enum, trade_license_no, nationality, is_absentee, metadata, source/confidence/audit fields.
+Relationships: linked from transactions (buyer/seller), property_owners, leads, conversation messages; backed by owner_contacts for reachability.
+### owner_contacts
+Purpose: structured contacts per owner with type-specific uniqueness.
+Key columns: id, owner_id FK, contact_type enum (mobile/email/etc.), value, is_primary, verified_at, metadata, timestamps.
+Relationships: cascades with owner; used by chat and lead assignment tools to surface contactable owners.
+### property_owners
+Purpose: many-to-many relationship between properties and owners with ownership share metadata.
+Key columns: id, property_id, owner_id, ownership_share, is_primary, source/confidence/audit fields.
+Relationships: supports multi-owner units; used in v_multi_property_owners view to detect portfolios; anchors leads to parties.
+### properties
+Purpose: canonical property dimension representing the latest known state for every unit.
+Key columns: ids of geography hierarchy (community/district/project/cluster/building), unit_identifier, property_number, property_type, usage enum, sub_type, completion enum, bedrooms/bathrooms, floor_label, status, tenancy_status, hold_years, sizes (sqm/sqft, built_up, plot), municipality_no/sub_no/land_number, view, geom (Point), description_embedding (vector 1536), embedding_model, embedding_generated_at, metadata, source/confidence/audit timestamps.
+Relationships: referenced by transactions, property_events, leads, conversation messages, chunks, rag_documents; unique constraint on building + unit_identifier prevents duplicates.
+### transactions
+Purpose: fact table for historical sale/rental events tied to properties and owners.
+Key columns: id, property_id, event_date, price, price_per_sqm/price_per_sqft, transaction_type, completion/usage enums, property_type, beds/baths, actual sizes, buyer_owner_id, seller_owner_id, metadata, source/confidence/audit timestamps.
+Relationships: used for CMAs, price-per-sqft calculations, hold period metrics; indexes on property_id + event_date speed timeline queries.
+### property_events
+Purpose: append-only log of lifecycle changes (listing, price change, valuation update) for each property.
+Key columns: id, property_id, event_type enum, old_value/new_value JSONB snapshots, event_date, source/confidence, created_by agent.
+Relationships: complements transactions to track non-transactional state changes; indexed by property_id and event_date for fast history retrieval.
+### leads
+Purpose: CRM-like table for prospecting with linkage to owners/properties and assignment to agents.
+Key columns: id, owner_id, property_id, lead_type enum, status enum, source, assigned_agent_id, score, campaign_id, metadata, confidence/audit timestamps.
+Relationships: lead_actions child table records touchpoints; conversation messages can link to leads; used by chat tools to auto-log follow-ups.
+### lead_actions
+Purpose: chronological log of actions taken on a lead.
+Key columns: id, lead_id FK, action_type enum, outcome enum, action_date, notes, agent_id, metadata.
+Relationships: aggregated to compute last_action_at and response SLAs; used by v_hot_leads view.
+### conversations
+Purpose: captures threaded user-agent interactions with intent classification and assignment.
+Key columns: id (uuid), title, user_id, assigned_agent_id, intent enum, metadata, timestamps + last_message previews.
+Relationships: parent of conversation_messages; can be linked to leads and properties indirectly.
+### conversation_messages
+Purpose: individual chat messages with optional linkage to domain entities.
+Key columns: id (uuid), conversation_id FK, role (user/assistant/tool), content, linked_property_id, linked_owner_id, linked_lead_id, tool_calls JSONB, intent, metadata, created_at.
+Relationships: indexed for retrieval by conversation and linked objects, enabling conversational analytics and backreferences in RAG.
+### chunks
+Purpose: semantic chunks derived from property descriptions or documents, each with an embedding for vector search.
+Key columns: id, property_id, content, embedding (vector 1536), metadata, source/confidence, created_at.
+Relationships: used by search RPCs and chat retrieval to provide dense context alongside structured joins.
+### data_quality_flags
+Purpose: records data issues (duplicates, missing fields, mismatches) across any table.
+Key columns: id, table_name, record_id, issue_type, issue_details JSONB, resolved_at/by, created_at/by.
+Relationships: enables QA dashboards and prevents ingestion from silently ignoring anomalies.
+### rag_documents
+Purpose: curated text chunks (marketing blurbs, neighborhood descriptions, analytic summaries) tied to properties with embeddings.
+Key columns: id, property_id FK, title, content, embedding + model, metadata, source, created/updated timestamps.
+Relationships: vector indexed (ivfflat) for fast retrieval; paired with rag_prompt_templates and v_chat_context.
+### rag_prompt_templates
+Purpose: version-controlled prompt templates with required fields for deterministic chat generation.
+Key columns: id, name (unique), description, template text, required_fields array, metadata, timestamps.
+Relationships: referenced by rag_conversations; loaded by backend chat tools to avoid hard-coded prompts.
+### rag_conversations
+Purpose: audit log of RAG runs, linking prompts, properties, and responses.
+Key columns: id, property_id, prompt_template_id, user_input, assistant_response, metadata, created_at.
+Relationships: helps evaluate retrieval quality and template performance per property.
+### views & helpers
+- v_multi_property_owners: aggregates portfolio size/footprint per owner via property_owners.
+- v_hot_leads: surfaces qualified/hot leads with last_action_at for prioritization.
+- v_property_hold_duration (baseline schema): computes hold_years and entry price per sqft.
+These views fuel dashboards and chat narratives without recomputing joins in code.
+## Ingestion Flow and Persistence
+- `database/scripts/ingest_dubai_real_estate.py` normalizes Excel/CSV sources, resolves aliases against buildings/communities, upserts owners, properties, and transactions, and prints metrics.
+- Optional AI enrichment (`ai_enrichment.py`) calls Gemini to classify communities/projects/buildings and propose aliases; results populate metadata and alias tables.
+- Bulk upserts respect unique constraints (building + unit_identifier, alias uniqueness) to avoid duplicates while preserving history in transactions and property_events.
+- After ingestion, embeddings can be generated via `backend/scripts/generate_embeddings.py` or `populate_property_embeddings.py`, filling `properties.description_embedding`, `chunks.embedding`, and `rag_documents.embedding`.
+- RPCs and functions (see `database/functions/*.sql`) are applied via `database/scripts/apply_rpc_functions.py` to expose search endpoints to Supabase/pg.
+## Use Case Gallery (Structured tables)
+Below are concrete lines describing how each structured table can be queried. Each line stands on its own as a mini recipe the chat agent or an analyst can execute. They intentionally repeat patterns with different filters to make the catalog exhaustive.
+### Property queries
+- Property query 1: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 1: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 1: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 2: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 2: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 2: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 3: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 3: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 3: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 4: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 4: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 4: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 5: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 5: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 5: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 6: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 6: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 6: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 7: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 7: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 7: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 8: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 8: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 8: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 9: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 9: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 9: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 10: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 10: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 10: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 11: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 11: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 11: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 12: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 12: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 12: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 13: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 13: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 13: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 14: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 14: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 14: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 15: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 15: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 15: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 16: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 16: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 16: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 17: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 17: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 17: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 18: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 18: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 18: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 19: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 19: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 19: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 20: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 20: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 20: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 21: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 21: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 21: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 22: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 22: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 22: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 23: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 23: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 23: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 24: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 24: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 24: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 25: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 25: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 25: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 26: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 26: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 26: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 27: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 27: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 27: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 28: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 28: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 28: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 29: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 29: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 29: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 30: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 30: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 30: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 31: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 31: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 31: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 32: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 32: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 32: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 33: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 33: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 33: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 34: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 34: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 34: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 35: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 35: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 35: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 36: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 36: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 36: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 37: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 37: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 37: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 38: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 38: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 38: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 39: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 39: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 39: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 40: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 40: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 40: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 41: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 41: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 41: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 42: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 42: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 42: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 43: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 43: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 43: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 44: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 44: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 44: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 45: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 45: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 45: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 46: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 46: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 46: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 47: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 47: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 47: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 48: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 48: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 48: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 49: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 49: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 49: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 50: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 50: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 50: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 51: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 51: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 51: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 52: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 52: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 52: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 53: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 53: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 53: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 54: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 54: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 54: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 55: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 55: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 55: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 56: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 56: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 56: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 57: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 57: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 57: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 58: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 58: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 58: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 59: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 59: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 59: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 60: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 60: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 60: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 61: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 61: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 61: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 62: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 62: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 62: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 63: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 63: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 63: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 64: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 64: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 64: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 65: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 65: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 65: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 66: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 66: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 66: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 67: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 67: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 67: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 68: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 68: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 68: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 69: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 69: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 69: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 70: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 70: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 70: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 71: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 71: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 71: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 72: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 72: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 72: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 73: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 73: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 73: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 74: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 74: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 74: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 75: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 75: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 75: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 76: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 76: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 76: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 77: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 77: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 77: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 78: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 78: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 78: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 79: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 79: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 79: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 80: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 80: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 80: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 81: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 81: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 81: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 82: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 82: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 82: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 83: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 83: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 83: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 84: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 84: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 84: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 85: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 85: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 85: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 86: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 86: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 86: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 87: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 87: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 87: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 88: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 88: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 88: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 89: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 89: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 89: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 90: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 90: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 90: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 91: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 91: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 91: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 92: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 92: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 92: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 93: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 93: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 93: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 94: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 94: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 94: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 95: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 95: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 95: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 96: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 96: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 96: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 97: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 97: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 97: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 98: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 98: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 98: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 99: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 99: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 99: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 100: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 100: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 100: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 101: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 101: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 101: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 102: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 102: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 102: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 103: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 103: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 103: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 104: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 104: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 104: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 105: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 105: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 105: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 106: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 106: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 106: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 107: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 107: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 107: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 108: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 108: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 108: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 109: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 109: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 109: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 110: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 110: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 110: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 111: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 111: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 111: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 112: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 112: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 112: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 113: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 113: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 113: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 114: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 114: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 114: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 115: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 115: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 115: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 116: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 116: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 116: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 117: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 117: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 117: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 118: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 118: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 118: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 119: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 119: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 119: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 120: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 120: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 120: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 121: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 121: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 121: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 122: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 122: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 122: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 123: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 123: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 123: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 124: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 124: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 124: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 125: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 125: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 125: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 126: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 126: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 126: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 127: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 127: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 127: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 128: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 128: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 128: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 129: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 129: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 129: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 130: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 130: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 130: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 131: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 131: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 131: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 132: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 132: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 132: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 133: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 133: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 133: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 134: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 134: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 134: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 135: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 135: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 135: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 136: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 136: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 136: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 137: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 137: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 137: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 138: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 138: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 138: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 139: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 139: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 139: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 140: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 140: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 140: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 141: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 141: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 141: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 142: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 142: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 142: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 143: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 143: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 143: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 144: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 144: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 144: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 145: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 145: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 145: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 146: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 146: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 146: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 147: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 147: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 147: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 148: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 148: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 148: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 149: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 149: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 149: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 150: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 150: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 150: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 151: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 151: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 151: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 152: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 152: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 152: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 153: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 153: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 153: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 154: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 154: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 154: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 155: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 155: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 155: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 156: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 156: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 156: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 157: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 157: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 157: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 158: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 158: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 158: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 159: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 159: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 159: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 160: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 160: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 160: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 161: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 161: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 161: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 162: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 162: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 162: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 163: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 163: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 163: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 164: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 164: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 164: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 165: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 165: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 165: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 166: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 166: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 166: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 167: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 167: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 167: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 168: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 168: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 168: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 169: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 169: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 169: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 170: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 170: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 170: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 171: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 171: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 171: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 172: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 172: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 172: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 173: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 173: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 173: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 174: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 174: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 174: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 175: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 175: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 175: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 176: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 176: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 176: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 177: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 177: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 177: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 178: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 178: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 178: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 179: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 179: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 179: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 180: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 180: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 180: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 181: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 181: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 181: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 182: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 182: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 182: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 183: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 183: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 183: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 184: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 184: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 184: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 185: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 185: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 185: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 186: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 186: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 186: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 187: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 187: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 187: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 188: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 188: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 188: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 189: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 189: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 189: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 190: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 190: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 190: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 191: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 191: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 191: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 192: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 192: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 192: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 193: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 193: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 193: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 194: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 194: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 194: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 195: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 195: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 195: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 196: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 196: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 196: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 197: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 197: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 197: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 198: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 198: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 198: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 199: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 199: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 199: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 200: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 200: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 200: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 201: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 201: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 201: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 202: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 202: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 202: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 203: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 203: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 203: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 204: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 204: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 204: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 205: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 205: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 205: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 206: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 206: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 206: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 207: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 207: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 207: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 208: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 208: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 208: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 209: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 209: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 209: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 210: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 210: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 210: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 211: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 211: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 211: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 212: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 212: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 212: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 213: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 213: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 213: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 214: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 214: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 214: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 215: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 215: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 215: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 216: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 216: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 216: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 217: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 217: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 217: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 218: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 218: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 218: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 219: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 219: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 219: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 220: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 220: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 220: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 221: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 221: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 221: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 222: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 222: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 222: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 223: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 223: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 223: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 224: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 224: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 224: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 225: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 225: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 225: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 226: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 226: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 226: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 227: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 227: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 227: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 228: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 228: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 228: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 229: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 229: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 229: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 230: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 230: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 230: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 231: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 231: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 231: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 232: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 232: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 232: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 233: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 233: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 233: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 234: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 234: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 234: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 235: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 235: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 235: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 236: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 236: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 236: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 237: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 237: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 237: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 238: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 238: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 238: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 239: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 239: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 239: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 240: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 240: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 240: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 241: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 241: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 241: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 242: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 242: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 242: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 243: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 243: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 243: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 244: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 244: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 244: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 245: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 245: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 245: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 246: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 246: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 246: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 247: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 247: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 247: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 248: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 248: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 248: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 249: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 249: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 249: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 250: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 250: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 250: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 251: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 251: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 251: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 252: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 252: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 252: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 253: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 253: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 253: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 254: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 254: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 254: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 255: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 255: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 255: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 256: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 256: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 256: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 257: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 257: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 257: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 258: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 258: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 258: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 259: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 259: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 259: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 260: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 260: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 260: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 261: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 261: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 261: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 262: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 262: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 262: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 263: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 263: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 263: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 264: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 264: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 264: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 265: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 265: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 265: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 266: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 266: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 266: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 267: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 267: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 267: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 268: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 268: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 268: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 269: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 269: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 269: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 270: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 270: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 270: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 271: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 271: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 271: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 272: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 272: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 272: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 273: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 273: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 273: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 274: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 274: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 274: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 275: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 275: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 275: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 276: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 276: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 276: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 277: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 277: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 277: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 278: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 278: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 278: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 279: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 279: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 279: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 280: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 280: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 280: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 281: filter properties in Dubai Marina with usage `residential`, completion `ready`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 281: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 281: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 282: filter properties in Downtown Dubai with usage `commercial`, completion `off_plan`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 282: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 282: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 283: filter properties in Palm Jumeirah with usage `mixed_use`, completion `under_construction`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 283: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 283: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 284: filter properties in Business Bay with usage `hotel`, completion `unknown`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 284: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 284: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 285: filter properties in Jumeirah Village Circle with usage `industrial`, completion `ready`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 285: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 285: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 286: filter properties in Arabian Ranches with usage `residential`, completion `off_plan`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 286: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 286: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 287: filter properties in Dubai Hills Estate with usage `commercial`, completion `under_construction`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 287: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 287: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 288: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `unknown`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 288: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 288: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 289: filter properties in Al Barsha with usage `hotel`, completion `ready`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 289: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 289: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 290: filter properties in Bluewaters with usage `industrial`, completion `off_plan`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 290: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 290: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 291: filter properties in Dubai Marina with usage `residential`, completion `under_construction`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 291: rank units in Dubai Marina by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 291: retrieve properties in Dubai Marina with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 292: filter properties in Downtown Dubai with usage `commercial`, completion `unknown`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 292: rank units in Downtown Dubai by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 292: retrieve properties in Downtown Dubai with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 293: filter properties in Palm Jumeirah with usage `mixed_use`, completion `ready`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 293: rank units in Palm Jumeirah by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 293: retrieve properties in Palm Jumeirah with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 294: filter properties in Business Bay with usage `hotel`, completion `off_plan`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 294: rank units in Business Bay by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 294: retrieve properties in Business Bay with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 295: filter properties in Jumeirah Village Circle with usage `industrial`, completion `under_construction`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 295: rank units in Jumeirah Village Circle by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 295: retrieve properties in Jumeirah Village Circle with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 296: filter properties in Arabian Ranches with usage `residential`, completion `unknown`, and view preference `marina view`, joining buildings + projects to show developer and completion history.
+- Property scenario 296: rank units in Arabian Ranches by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 296: retrieve properties in Arabian Ranches with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 297: filter properties in Dubai Hills Estate with usage `commercial`, completion `ready`, and view preference `sea view`, joining buildings + projects to show developer and completion history.
+- Property scenario 297: rank units in Dubai Hills Estate by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 297: retrieve properties in Dubai Hills Estate with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 298: filter properties in Jumeirah Lake Towers with usage `mixed_use`, completion `off_plan`, and view preference `burj view`, joining buildings + projects to show developer and completion history.
+- Property scenario 298: rank units in Jumeirah Lake Towers by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 298: retrieve properties in Jumeirah Lake Towers with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 299: filter properties in Al Barsha with usage `hotel`, completion `under_construction`, and view preference `canal view`, joining buildings + projects to show developer and completion history.
+- Property scenario 299: rank units in Al Barsha by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 299: retrieve properties in Al Barsha with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+- Property query 300: filter properties in Bluewaters with usage `industrial`, completion `unknown`, and view preference `park view`, joining buildings + projects to show developer and completion history.
+- Property scenario 300: rank units in Bluewaters by price_per_sqft using transactions joined to properties, surfacing hold_years and latest valuation event.
+- Property context 300: retrieve properties in Bluewaters with embeddings present, showing embedding_model and generated_at for semantic search readiness.
+### Transaction timelines
+- Transaction timeline 1: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 1: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 1: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 2: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 2: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 2: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 3: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 3: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 3: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 4: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 4: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 4: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 5: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 5: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 5: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 6: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 6: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 6: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 7: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 7: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 7: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 8: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 8: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 8: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 9: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 9: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 9: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 10: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 10: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 10: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 11: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 11: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 11: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 12: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 12: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 12: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 13: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 13: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 13: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 14: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 14: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 14: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 15: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 15: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 15: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 16: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 16: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 16: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 17: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 17: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 17: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 18: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 18: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 18: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 19: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 19: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 19: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 20: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 20: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 20: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 21: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 21: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 21: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 22: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 22: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 22: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 23: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 23: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 23: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 24: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 24: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 24: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 25: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 25: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 25: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 26: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 26: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 26: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 27: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 27: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 27: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 28: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 28: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 28: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 29: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 29: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 29: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 30: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 30: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 30: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 31: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 31: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 31: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 32: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 32: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 32: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 33: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 33: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 33: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 34: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 34: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 34: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 35: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 35: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 35: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 36: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 36: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 36: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 37: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 37: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 37: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 38: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 38: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 38: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 39: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 39: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 39: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 40: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 40: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 40: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 41: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 41: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 41: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 42: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 42: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 42: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 43: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 43: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 43: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 44: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 44: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 44: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 45: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 45: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 45: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 46: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 46: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 46: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 47: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 47: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 47: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 48: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 48: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 48: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 49: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 49: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 49: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 50: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 50: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 50: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 51: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 51: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 51: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 52: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 52: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 52: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 53: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 53: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 53: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 54: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 54: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 54: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 55: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 55: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 55: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 56: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 56: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 56: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 57: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 57: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 57: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 58: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 58: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 58: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 59: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 59: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 59: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 60: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 60: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 60: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 61: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 61: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 61: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 62: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 62: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 62: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 63: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 63: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 63: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 64: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 64: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 64: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 65: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 65: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 65: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 66: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 66: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 66: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 67: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 67: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 67: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 68: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 68: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 68: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 69: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 69: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 69: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 70: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 70: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 70: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 71: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 71: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 71: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 72: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 72: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 72: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 73: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 73: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 73: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 74: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 74: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 74: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 75: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 75: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 75: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 76: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 76: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 76: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 77: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 77: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 77: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 78: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 78: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 78: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 79: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 79: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 79: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 80: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 80: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 80: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 81: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 81: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 81: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 82: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 82: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 82: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 83: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 83: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 83: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 84: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 84: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 84: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 85: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 85: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 85: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 86: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 86: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 86: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 87: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 87: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 87: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 88: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 88: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 88: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 89: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 89: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 89: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 90: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 90: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 90: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 91: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 91: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 91: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 92: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 92: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 92: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 93: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 93: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 93: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 94: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 94: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 94: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 95: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 95: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 95: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 96: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 96: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 96: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 97: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 97: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 97: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 98: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 98: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 98: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 99: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 99: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 99: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 100: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 100: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 100: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 101: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 101: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 101: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 102: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 102: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 102: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 103: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 103: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 103: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 104: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 104: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 104: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 105: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 105: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 105: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 106: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 106: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 106: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 107: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 107: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 107: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 108: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 108: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 108: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 109: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 109: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 109: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 110: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 110: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 110: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 111: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 111: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 111: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 112: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 112: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 112: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 113: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 113: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 113: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 114: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 114: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 114: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 115: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 115: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 115: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 116: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 116: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 116: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 117: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 117: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 117: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 118: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 118: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 118: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 119: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 119: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 119: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 120: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 120: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 120: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 121: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 121: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 121: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 122: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 122: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 122: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 123: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 123: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 123: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 124: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 124: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 124: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 125: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 125: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 125: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 126: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 126: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 126: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 127: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 127: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 127: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 128: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 128: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 128: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 129: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 129: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 129: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 130: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 130: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 130: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 131: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 131: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 131: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 132: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 132: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 132: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 133: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 133: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 133: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 134: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 134: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 134: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 135: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 135: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 135: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 136: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 136: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 136: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 137: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 137: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 137: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 138: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 138: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 138: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 139: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 139: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 139: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 140: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 140: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 140: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 141: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 141: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 141: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 142: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 142: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 142: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 143: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 143: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 143: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 144: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 144: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 144: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 145: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 145: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 145: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 146: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 146: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 146: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 147: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 147: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 147: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 148: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 148: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 148: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 149: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 149: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 149: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 150: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 150: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 150: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 151: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 151: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 151: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 152: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 152: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 152: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 153: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 153: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 153: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 154: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 154: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 154: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 155: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 155: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 155: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 156: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 156: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 156: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 157: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 157: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 157: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 158: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 158: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 158: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 159: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 159: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 159: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 160: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 160: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 160: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 161: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 161: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 161: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 162: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 162: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 162: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 163: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 163: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 163: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 164: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 164: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 164: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 165: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 165: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 165: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 166: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 166: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 166: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 167: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 167: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 167: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 168: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 168: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 168: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 169: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 169: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 169: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 170: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 170: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 170: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 171: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 171: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 171: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 172: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 172: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 172: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 173: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 173: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 173: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 174: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 174: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 174: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 175: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 175: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 175: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 176: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 176: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 176: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 177: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 177: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 177: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 178: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 178: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 178: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 179: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 179: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 179: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 180: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 180: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 180: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 181: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 181: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 181: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 182: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 182: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 182: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 183: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 183: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 183: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 184: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 184: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 184: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 185: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 185: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 185: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 186: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 186: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 186: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 187: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 187: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 187: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 188: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 188: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 188: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 189: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 189: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 189: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 190: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 190: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 190: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 191: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 191: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 191: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 192: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 192: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 192: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 193: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 193: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 193: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 194: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 194: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 194: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 195: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 195: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 195: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 196: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 196: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 196: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 197: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 197: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 197: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 198: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 198: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 198: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 199: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 199: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 199: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 200: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 200: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 200: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 201: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 201: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 201: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 202: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 202: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 202: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 203: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 203: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 203: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 204: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 204: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 204: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 205: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 205: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 205: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 206: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 206: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 206: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 207: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 207: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 207: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 208: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 208: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 208: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 209: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 209: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 209: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 210: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 210: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 210: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 211: list all transactions for Emaar Beachfront in Dubai Marina, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 211: compute median price_per_sqft for Dubai Marina over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 211: flag transactions in Dubai Marina where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 212: list all transactions for Dubai Creek Harbour in Downtown Dubai, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 212: compute median price_per_sqft for Downtown Dubai over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 212: flag transactions in Downtown Dubai where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 213: list all transactions for Jumeirah Islands in Palm Jumeirah, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 213: compute median price_per_sqft for Palm Jumeirah over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 213: flag transactions in Palm Jumeirah where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 214: list all transactions for City Walk in Business Bay, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 214: compute median price_per_sqft for Business Bay over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 214: flag transactions in Business Bay where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 215: list all transactions for Bluewaters Residences in Jumeirah Village Circle, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 215: compute median price_per_sqft for Jumeirah Village Circle over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 215: flag transactions in Jumeirah Village Circle where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 216: list all transactions for Index Tower in Arabian Ranches, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 216: compute median price_per_sqft for Arabian Ranches over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 216: flag transactions in Arabian Ranches where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 217: list all transactions for Burj Khalifa in Dubai Hills Estate, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 217: compute median price_per_sqft for Dubai Hills Estate over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 217: flag transactions in Dubai Hills Estate where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 218: list all transactions for The Address in Jumeirah Lake Towers, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 218: compute median price_per_sqft for Jumeirah Lake Towers over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 218: flag transactions in Jumeirah Lake Towers where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 219: list all transactions for Serenia Residences in Al Barsha, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 219: compute median price_per_sqft for Al Barsha over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 219: flag transactions in Al Barsha where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+- Transaction timeline 220: list all transactions for Port De La Mer in Bluewaters, ordered by event_date, with price_per_sqft deltas and buyer/seller owner resolution.
+- Transaction CMA 220: compute median price_per_sqft for Bluewaters over the last 12 months, grouped by property_type and completion status.
+- Transaction anomaly 220: flag transactions in Bluewaters where actual_size_sqft differs from property.size_sqft by >10%, writing data_quality_flags entries.
+### Owners and portfolios
+- Owner portfolio 1: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 1: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 1: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 2: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 2: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 2: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 3: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 3: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 3: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 4: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 4: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 4: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 5: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 5: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 5: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 6: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 6: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 6: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 7: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 7: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 7: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 8: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 8: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 8: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 9: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 9: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 9: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 10: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 10: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 10: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 11: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 11: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 11: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 12: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 12: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 12: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 13: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 13: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 13: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 14: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 14: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 14: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 15: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 15: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 15: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 16: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 16: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 16: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 17: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 17: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 17: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 18: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 18: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 18: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 19: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 19: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 19: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 20: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 20: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 20: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 21: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 21: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 21: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 22: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 22: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 22: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 23: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 23: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 23: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 24: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 24: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 24: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 25: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 25: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 25: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 26: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 26: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 26: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 27: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 27: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 27: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 28: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 28: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 28: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 29: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 29: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 29: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 30: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 30: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 30: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 31: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 31: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 31: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 32: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 32: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 32: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 33: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 33: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 33: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 34: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 34: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 34: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 35: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 35: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 35: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 36: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 36: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 36: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 37: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 37: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 37: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 38: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 38: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 38: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 39: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 39: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 39: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 40: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 40: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 40: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 41: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 41: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 41: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 42: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 42: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 42: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 43: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 43: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 43: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 44: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 44: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 44: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 45: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 45: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 45: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 46: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 46: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 46: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 47: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 47: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 47: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 48: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 48: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 48: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 49: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 49: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 49: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 50: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 50: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 50: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 51: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 51: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 51: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 52: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 52: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 52: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 53: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 53: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 53: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 54: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 54: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 54: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 55: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 55: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 55: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 56: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 56: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 56: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 57: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 57: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 57: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 58: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 58: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 58: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 59: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 59: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 59: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 60: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 60: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 60: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 61: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 61: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 61: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 62: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 62: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 62: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 63: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 63: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 63: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 64: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 64: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 64: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 65: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 65: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 65: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 66: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 66: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 66: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 67: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 67: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 67: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 68: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 68: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 68: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 69: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 69: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 69: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 70: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 70: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 70: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 71: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 71: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 71: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 72: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 72: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 72: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 73: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 73: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 73: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 74: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 74: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 74: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 75: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 75: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 75: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 76: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 76: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 76: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 77: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 77: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 77: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 78: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 78: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 78: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 79: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 79: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 79: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 80: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 80: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 80: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 81: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 81: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 81: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 82: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 82: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 82: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 83: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 83: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 83: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 84: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 84: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 84: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 85: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 85: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 85: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 86: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 86: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 86: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 87: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 87: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 87: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 88: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 88: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 88: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 89: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 89: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 89: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 90: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 90: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 90: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 91: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 91: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 91: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 92: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 92: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 92: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 93: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 93: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 93: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 94: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 94: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 94: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 95: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 95: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 95: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 96: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 96: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 96: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 97: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 97: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 97: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 98: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 98: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 98: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 99: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 99: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 99: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 100: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 100: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 100: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 101: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 101: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 101: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 102: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 102: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 102: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 103: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 103: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 103: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 104: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 104: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 104: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 105: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 105: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 105: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 106: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 106: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 106: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 107: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 107: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 107: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 108: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 108: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 108: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 109: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 109: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 109: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 110: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 110: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 110: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 111: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 111: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 111: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 112: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 112: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 112: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 113: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 113: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 113: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 114: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 114: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 114: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 115: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 115: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 115: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 116: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 116: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 116: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 117: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 117: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 117: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 118: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 118: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 118: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 119: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 119: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 119: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 120: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 120: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 120: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 121: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 121: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 121: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 122: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 122: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 122: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 123: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 123: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 123: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 124: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 124: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 124: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 125: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 125: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 125: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 126: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 126: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 126: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 127: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 127: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 127: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 128: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 128: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 128: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 129: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 129: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 129: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 130: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 130: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 130: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 131: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 131: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 131: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 132: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 132: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 132: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 133: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 133: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 133: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 134: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 134: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 134: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 135: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 135: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 135: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 136: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 136: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 136: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 137: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 137: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 137: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 138: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 138: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 138: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 139: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 139: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 139: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 140: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 140: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 140: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 141: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 141: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 141: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 142: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 142: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 142: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 143: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 143: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 143: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 144: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 144: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 144: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 145: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 145: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 145: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 146: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 146: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 146: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 147: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 147: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 147: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 148: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 148: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 148: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 149: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 149: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 149: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 150: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 150: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 150: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 151: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 151: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 151: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 152: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 152: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 152: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 153: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 153: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 153: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 154: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 154: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 154: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 155: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 155: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 155: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 156: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 156: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 156: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 157: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 157: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 157: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 158: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 158: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 158: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 159: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 159: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 159: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 160: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 160: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 160: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 161: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 161: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 161: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 162: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 162: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 162: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 163: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 163: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 163: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 164: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 164: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 164: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 165: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 165: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 165: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 166: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 166: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 166: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 167: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 167: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 167: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 168: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 168: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 168: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 169: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 169: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 169: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 170: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 170: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 170: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 171: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 171: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 171: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 172: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 172: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 172: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 173: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 173: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 173: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 174: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 174: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 174: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 175: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 175: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 175: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 176: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 176: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 176: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 177: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 177: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 177: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 178: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 178: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 178: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 179: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 179: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 179: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 180: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 180: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 180: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 181: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 181: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 181: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 182: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 182: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 182: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 183: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 183: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 183: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 184: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 184: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 184: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 185: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 185: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 185: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 186: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 186: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 186: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 187: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 187: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 187: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 188: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 188: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 188: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 189: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 189: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 189: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 190: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 190: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 190: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+- Owner portfolio 191: identify owners with >2 properties in Dubai Marina using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 191: find owners in Dubai Marina with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 191: filter owners marked is_absentee=true with holdings in Dubai Marina, feeding nurture campaigns.
+- Owner portfolio 192: identify owners with >2 properties in Downtown Dubai using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 192: find owners in Downtown Dubai with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 192: filter owners marked is_absentee=true with holdings in Downtown Dubai, feeding nurture campaigns.
+- Owner portfolio 193: identify owners with >2 properties in Palm Jumeirah using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 193: find owners in Palm Jumeirah with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 193: filter owners marked is_absentee=true with holdings in Palm Jumeirah, feeding nurture campaigns.
+- Owner portfolio 194: identify owners with >2 properties in Business Bay using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 194: find owners in Business Bay with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 194: filter owners marked is_absentee=true with holdings in Business Bay, feeding nurture campaigns.
+- Owner portfolio 195: identify owners with >2 properties in Jumeirah Village Circle using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 195: find owners in Jumeirah Village Circle with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 195: filter owners marked is_absentee=true with holdings in Jumeirah Village Circle, feeding nurture campaigns.
+- Owner portfolio 196: identify owners with >2 properties in Arabian Ranches using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 196: find owners in Arabian Ranches with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 196: filter owners marked is_absentee=true with holdings in Arabian Ranches, feeding nurture campaigns.
+- Owner portfolio 197: identify owners with >2 properties in Dubai Hills Estate using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 197: find owners in Dubai Hills Estate with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 197: filter owners marked is_absentee=true with holdings in Dubai Hills Estate, feeding nurture campaigns.
+- Owner portfolio 198: identify owners with >2 properties in Jumeirah Lake Towers using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 198: find owners in Jumeirah Lake Towers with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 198: filter owners marked is_absentee=true with holdings in Jumeirah Lake Towers, feeding nurture campaigns.
+- Owner portfolio 199: identify owners with >2 properties in Al Barsha using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 199: find owners in Al Barsha with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 199: filter owners marked is_absentee=true with holdings in Al Barsha, feeding nurture campaigns.
+- Owner portfolio 200: identify owners with >2 properties in Bluewaters using v_multi_property_owners and property_owners, returning total_sqft and last activity.
+- Owner contact 200: find owners in Bluewaters with verified primary mobile in owner_contacts and recent transactions, preparing for outreach.
+- Owner absenteeism 200: filter owners marked is_absentee=true with holdings in Bluewaters, feeding nurture campaigns.
+### Leads and actions
+- Lead follow-up 1: surface leads with status `new` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 1: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 1: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 2: surface leads with status `contacted` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 2: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 2: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 3: surface leads with status `qualified` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 3: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 3: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 4: surface leads with status `hot` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 4: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 4: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 5: surface leads with status `nurture` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 5: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 5: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 6: surface leads with status `won` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 6: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 6: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 7: surface leads with status `lost` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 7: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 7: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 8: surface leads with status `inactive` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 8: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 8: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 9: surface leads with status `new` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 9: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 9: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 10: surface leads with status `contacted` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 10: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 10: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 11: surface leads with status `qualified` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 11: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 11: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 12: surface leads with status `hot` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 12: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 12: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 13: surface leads with status `nurture` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 13: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 13: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 14: surface leads with status `won` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 14: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 14: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 15: surface leads with status `lost` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 15: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 15: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 16: surface leads with status `inactive` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 16: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 16: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 17: surface leads with status `new` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 17: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 17: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 18: surface leads with status `contacted` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 18: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 18: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 19: surface leads with status `qualified` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 19: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 19: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 20: surface leads with status `hot` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 20: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 20: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 21: surface leads with status `nurture` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 21: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 21: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 22: surface leads with status `won` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 22: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 22: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 23: surface leads with status `lost` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 23: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 23: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 24: surface leads with status `inactive` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 24: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 24: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 25: surface leads with status `new` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 25: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 25: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 26: surface leads with status `contacted` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 26: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 26: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 27: surface leads with status `qualified` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 27: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 27: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 28: surface leads with status `hot` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 28: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 28: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 29: surface leads with status `nurture` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 29: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 29: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 30: surface leads with status `won` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 30: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 30: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 31: surface leads with status `lost` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 31: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 31: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 32: surface leads with status `inactive` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 32: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 32: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 33: surface leads with status `new` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 33: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 33: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 34: surface leads with status `contacted` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 34: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 34: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 35: surface leads with status `qualified` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 35: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 35: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 36: surface leads with status `hot` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 36: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 36: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 37: surface leads with status `nurture` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 37: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 37: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 38: surface leads with status `won` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 38: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 38: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 39: surface leads with status `lost` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 39: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 39: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 40: surface leads with status `inactive` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 40: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 40: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 41: surface leads with status `new` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 41: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 41: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 42: surface leads with status `contacted` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 42: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 42: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 43: surface leads with status `qualified` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 43: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 43: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 44: surface leads with status `hot` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 44: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 44: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 45: surface leads with status `nurture` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 45: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 45: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 46: surface leads with status `won` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 46: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 46: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 47: surface leads with status `lost` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 47: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 47: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 48: surface leads with status `inactive` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 48: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 48: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 49: surface leads with status `new` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 49: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 49: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 50: surface leads with status `contacted` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 50: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 50: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 51: surface leads with status `qualified` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 51: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 51: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 52: surface leads with status `hot` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 52: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 52: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 53: surface leads with status `nurture` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 53: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 53: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 54: surface leads with status `won` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 54: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 54: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 55: surface leads with status `lost` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 55: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 55: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 56: surface leads with status `inactive` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 56: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 56: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 57: surface leads with status `new` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 57: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 57: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 58: surface leads with status `contacted` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 58: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 58: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 59: surface leads with status `qualified` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 59: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 59: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 60: surface leads with status `hot` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 60: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 60: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 61: surface leads with status `nurture` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 61: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 61: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 62: surface leads with status `won` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 62: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 62: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 63: surface leads with status `lost` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 63: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 63: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 64: surface leads with status `inactive` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 64: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 64: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 65: surface leads with status `new` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 65: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 65: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 66: surface leads with status `contacted` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 66: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 66: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 67: surface leads with status `qualified` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 67: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 67: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 68: surface leads with status `hot` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 68: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 68: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 69: surface leads with status `nurture` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 69: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 69: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 70: surface leads with status `won` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 70: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 70: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 71: surface leads with status `lost` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 71: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 71: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 72: surface leads with status `inactive` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 72: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 72: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 73: surface leads with status `new` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 73: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 73: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 74: surface leads with status `contacted` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 74: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 74: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 75: surface leads with status `qualified` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 75: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 75: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 76: surface leads with status `hot` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 76: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 76: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 77: surface leads with status `nurture` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 77: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 77: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 78: surface leads with status `won` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 78: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 78: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 79: surface leads with status `lost` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 79: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 79: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 80: surface leads with status `inactive` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 80: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 80: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 81: surface leads with status `new` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 81: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 81: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 82: surface leads with status `contacted` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 82: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 82: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 83: surface leads with status `qualified` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 83: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 83: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 84: surface leads with status `hot` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 84: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 84: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 85: surface leads with status `nurture` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 85: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 85: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 86: surface leads with status `won` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 86: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 86: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 87: surface leads with status `lost` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 87: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 87: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 88: surface leads with status `inactive` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 88: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 88: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 89: surface leads with status `new` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 89: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 89: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 90: surface leads with status `contacted` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 90: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 90: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 91: surface leads with status `qualified` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 91: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 91: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 92: surface leads with status `hot` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 92: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 92: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 93: surface leads with status `nurture` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 93: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 93: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 94: surface leads with status `won` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 94: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 94: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 95: surface leads with status `lost` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 95: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 95: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 96: surface leads with status `inactive` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 96: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 96: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 97: surface leads with status `new` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 97: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 97: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 98: surface leads with status `contacted` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 98: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 98: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 99: surface leads with status `qualified` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 99: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 99: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 100: surface leads with status `hot` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 100: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 100: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 101: surface leads with status `nurture` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 101: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 101: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 102: surface leads with status `won` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 102: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 102: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 103: surface leads with status `lost` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 103: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 103: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 104: surface leads with status `inactive` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 104: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 104: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 105: surface leads with status `new` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 105: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 105: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 106: surface leads with status `contacted` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 106: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 106: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 107: surface leads with status `qualified` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 107: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 107: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 108: surface leads with status `hot` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 108: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 108: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 109: surface leads with status `nurture` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 109: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 109: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 110: surface leads with status `won` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 110: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 110: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 111: surface leads with status `lost` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 111: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 111: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 112: surface leads with status `inactive` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 112: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 112: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 113: surface leads with status `new` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 113: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 113: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 114: surface leads with status `contacted` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 114: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 114: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 115: surface leads with status `qualified` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 115: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 115: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 116: surface leads with status `hot` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 116: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 116: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 117: surface leads with status `nurture` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 117: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 117: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 118: surface leads with status `won` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 118: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 118: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 119: surface leads with status `lost` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 119: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 119: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 120: surface leads with status `inactive` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 120: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 120: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 121: surface leads with status `new` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 121: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 121: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 122: surface leads with status `contacted` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 122: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 122: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 123: surface leads with status `qualified` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 123: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 123: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 124: surface leads with status `hot` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 124: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 124: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 125: surface leads with status `nurture` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 125: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 125: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 126: surface leads with status `won` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 126: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 126: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 127: surface leads with status `lost` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 127: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 127: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 128: surface leads with status `inactive` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 128: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 128: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 129: surface leads with status `new` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 129: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 129: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 130: surface leads with status `contacted` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 130: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 130: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 131: surface leads with status `qualified` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 131: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 131: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 132: surface leads with status `hot` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 132: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 132: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 133: surface leads with status `nurture` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 133: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 133: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 134: surface leads with status `won` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 134: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 134: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 135: surface leads with status `lost` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 135: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 135: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 136: surface leads with status `inactive` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 136: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 136: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 137: surface leads with status `new` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 137: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 137: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 138: surface leads with status `contacted` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 138: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 138: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 139: surface leads with status `qualified` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 139: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 139: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 140: surface leads with status `hot` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 140: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 140: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 141: surface leads with status `nurture` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 141: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 141: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 142: surface leads with status `won` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 142: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 142: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 143: surface leads with status `lost` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 143: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 143: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 144: surface leads with status `inactive` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 144: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 144: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 145: surface leads with status `new` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 145: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 145: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 146: surface leads with status `contacted` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 146: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 146: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 147: surface leads with status `qualified` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 147: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 147: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 148: surface leads with status `hot` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 148: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 148: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 149: surface leads with status `nurture` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 149: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 149: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 150: surface leads with status `won` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 150: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 150: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 151: surface leads with status `lost` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 151: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 151: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 152: surface leads with status `inactive` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 152: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 152: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 153: surface leads with status `new` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 153: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 153: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 154: surface leads with status `contacted` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 154: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 154: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 155: surface leads with status `qualified` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 155: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 155: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 156: surface leads with status `hot` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 156: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 156: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 157: surface leads with status `nurture` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 157: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 157: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 158: surface leads with status `won` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 158: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 158: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 159: surface leads with status `lost` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 159: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 159: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 160: surface leads with status `inactive` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 160: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 160: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 161: surface leads with status `new` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 161: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 161: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 162: surface leads with status `contacted` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 162: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 162: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 163: surface leads with status `qualified` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 163: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 163: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 164: surface leads with status `hot` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 164: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 164: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 165: surface leads with status `nurture` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 165: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 165: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 166: surface leads with status `won` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 166: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 166: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 167: surface leads with status `lost` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 167: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 167: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 168: surface leads with status `inactive` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 168: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 168: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 169: surface leads with status `new` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 169: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 169: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 170: surface leads with status `contacted` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 170: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 170: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 171: surface leads with status `qualified` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 171: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 171: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 172: surface leads with status `hot` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 172: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 172: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 173: surface leads with status `nurture` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 173: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 173: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 174: surface leads with status `won` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 174: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 174: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 175: surface leads with status `lost` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 175: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 175: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 176: surface leads with status `inactive` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 176: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 176: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 177: surface leads with status `new` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 177: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 177: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 178: surface leads with status `contacted` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 178: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 178: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 179: surface leads with status `qualified` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 179: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 179: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 180: surface leads with status `hot` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 180: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 180: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 181: surface leads with status `nurture` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 181: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 181: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 182: surface leads with status `won` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 182: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 182: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 183: surface leads with status `lost` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 183: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 183: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 184: surface leads with status `inactive` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 184: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 184: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 185: surface leads with status `new` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 185: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 185: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 186: surface leads with status `contacted` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 186: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 186: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 187: surface leads with status `qualified` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 187: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 187: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 188: surface leads with status `hot` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 188: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 188: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 189: surface leads with status `nurture` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 189: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 189: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 190: surface leads with status `won` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 190: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 190: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 191: surface leads with status `lost` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 191: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 191: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 192: surface leads with status `inactive` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 192: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 192: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 193: surface leads with status `new` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 193: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 193: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 194: surface leads with status `contacted` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 194: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 194: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 195: surface leads with status `qualified` and lead_type `landlord`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 195: auto-assign `landlord` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 195: recompute lead.score for `landlord` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 196: surface leads with status `hot` and lead_type `tenant`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 196: auto-assign `tenant` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 196: recompute lead.score for `tenant` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 197: surface leads with status `nurture` and lead_type `investor`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 197: auto-assign `investor` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 197: recompute lead.score for `investor` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 198: surface leads with status `won` and lead_type `other`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 198: auto-assign `other` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 198: recompute lead.score for `other` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 199: surface leads with status `lost` and lead_type `seller`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 199: auto-assign `seller` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 199: recompute lead.score for `seller` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+- Lead follow-up 200: surface leads with status `inactive` and lead_type `buyer`, joined to last_action_at from lead_actions to enforce SLA.
+- Lead assignment 200: auto-assign `buyer` leads in Dubai Hills Estate to agents based on territory metadata stored on agents and conversations.
+- Lead scoring 200: recompute lead.score for `buyer` leads that reference properties with rising transaction velocity, persisting metadata reasons.
+### Geospatial and hierarchy use cases
+- Geospatial filter 1: find properties within boundary_geom of Dubai Marina and completion `ready`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 1: return buildings within 1km of a given point with completion `ready`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 1: show the full path (community ? district ? project ? cluster ? building) for units in Dubai Marina, ensuring aliases map to canonical building IDs.
+- Geospatial filter 2: find properties within boundary_geom of Downtown Dubai and completion `off_plan`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 2: return buildings within 1km of a given point with completion `off_plan`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 2: show the full path (community ? district ? project ? cluster ? building) for units in Downtown Dubai, ensuring aliases map to canonical building IDs.
+- Geospatial filter 3: find properties within boundary_geom of Palm Jumeirah and completion `under_construction`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 3: return buildings within 1km of a given point with completion `under_construction`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 3: show the full path (community ? district ? project ? cluster ? building) for units in Palm Jumeirah, ensuring aliases map to canonical building IDs.
+- Geospatial filter 4: find properties within boundary_geom of Business Bay and completion `unknown`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 4: return buildings within 1km of a given point with completion `unknown`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 4: show the full path (community ? district ? project ? cluster ? building) for units in Business Bay, ensuring aliases map to canonical building IDs.
+- Geospatial filter 5: find properties within boundary_geom of Jumeirah Village Circle and completion `ready`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 5: return buildings within 1km of a given point with completion `ready`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 5: show the full path (community ? district ? project ? cluster ? building) for units in Jumeirah Village Circle, ensuring aliases map to canonical building IDs.
+- Geospatial filter 6: find properties within boundary_geom of Arabian Ranches and completion `off_plan`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 6: return buildings within 1km of a given point with completion `off_plan`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 6: show the full path (community ? district ? project ? cluster ? building) for units in Arabian Ranches, ensuring aliases map to canonical building IDs.
+- Geospatial filter 7: find properties within boundary_geom of Dubai Hills Estate and completion `under_construction`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 7: return buildings within 1km of a given point with completion `under_construction`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 7: show the full path (community ? district ? project ? cluster ? building) for units in Dubai Hills Estate, ensuring aliases map to canonical building IDs.
+- Geospatial filter 8: find properties within boundary_geom of Jumeirah Lake Towers and completion `unknown`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 8: return buildings within 1km of a given point with completion `unknown`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 8: show the full path (community ? district ? project ? cluster ? building) for units in Jumeirah Lake Towers, ensuring aliases map to canonical building IDs.
+- Geospatial filter 9: find properties within boundary_geom of Al Barsha and completion `ready`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 9: return buildings within 1km of a given point with completion `ready`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 9: show the full path (community ? district ? project ? cluster ? building) for units in Al Barsha, ensuring aliases map to canonical building IDs.
+- Geospatial filter 10: find properties within boundary_geom of Bluewaters and completion `off_plan`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 10: return buildings within 1km of a given point with completion `off_plan`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 10: show the full path (community ? district ? project ? cluster ? building) for units in Bluewaters, ensuring aliases map to canonical building IDs.
+- Geospatial filter 11: find properties within boundary_geom of Dubai Marina and completion `under_construction`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 11: return buildings within 1km of a given point with completion `under_construction`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 11: show the full path (community ? district ? project ? cluster ? building) for units in Dubai Marina, ensuring aliases map to canonical building IDs.
+- Geospatial filter 12: find properties within boundary_geom of Downtown Dubai and completion `unknown`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 12: return buildings within 1km of a given point with completion `unknown`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 12: show the full path (community ? district ? project ? cluster ? building) for units in Downtown Dubai, ensuring aliases map to canonical building IDs.
+- Geospatial filter 13: find properties within boundary_geom of Palm Jumeirah and completion `ready`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 13: return buildings within 1km of a given point with completion `ready`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 13: show the full path (community ? district ? project ? cluster ? building) for units in Palm Jumeirah, ensuring aliases map to canonical building IDs.
+- Geospatial filter 14: find properties within boundary_geom of Business Bay and completion `off_plan`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 14: return buildings within 1km of a given point with completion `off_plan`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 14: show the full path (community ? district ? project ? cluster ? building) for units in Business Bay, ensuring aliases map to canonical building IDs.
+- Geospatial filter 15: find properties within boundary_geom of Jumeirah Village Circle and completion `under_construction`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 15: return buildings within 1km of a given point with completion `under_construction`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 15: show the full path (community ? district ? project ? cluster ? building) for units in Jumeirah Village Circle, ensuring aliases map to canonical building IDs.
+- Geospatial filter 16: find properties within boundary_geom of Arabian Ranches and completion `unknown`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 16: return buildings within 1km of a given point with completion `unknown`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 16: show the full path (community ? district ? project ? cluster ? building) for units in Arabian Ranches, ensuring aliases map to canonical building IDs.
+- Geospatial filter 17: find properties within boundary_geom of Dubai Hills Estate and completion `ready`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 17: return buildings within 1km of a given point with completion `ready`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 17: show the full path (community ? district ? project ? cluster ? building) for units in Dubai Hills Estate, ensuring aliases map to canonical building IDs.
+- Geospatial filter 18: find properties within boundary_geom of Jumeirah Lake Towers and completion `off_plan`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 18: return buildings within 1km of a given point with completion `off_plan`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 18: show the full path (community ? district ? project ? cluster ? building) for units in Jumeirah Lake Towers, ensuring aliases map to canonical building IDs.
+- Geospatial filter 19: find properties within boundary_geom of Al Barsha and completion `under_construction`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 19: return buildings within 1km of a given point with completion `under_construction`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 19: show the full path (community ? district ? project ? cluster ? building) for units in Al Barsha, ensuring aliases map to canonical building IDs.
+- Geospatial filter 20: find properties within boundary_geom of Bluewaters and completion `unknown`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 20: return buildings within 1km of a given point with completion `unknown`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 20: show the full path (community ? district ? project ? cluster ? building) for units in Bluewaters, ensuring aliases map to canonical building IDs.
+- Geospatial filter 21: find properties within boundary_geom of Dubai Marina and completion `ready`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 21: return buildings within 1km of a given point with completion `ready`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 21: show the full path (community ? district ? project ? cluster ? building) for units in Dubai Marina, ensuring aliases map to canonical building IDs.
+- Geospatial filter 22: find properties within boundary_geom of Downtown Dubai and completion `off_plan`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 22: return buildings within 1km of a given point with completion `off_plan`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 22: show the full path (community ? district ? project ? cluster ? building) for units in Downtown Dubai, ensuring aliases map to canonical building IDs.
+- Geospatial filter 23: find properties within boundary_geom of Palm Jumeirah and completion `under_construction`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 23: return buildings within 1km of a given point with completion `under_construction`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 23: show the full path (community ? district ? project ? cluster ? building) for units in Palm Jumeirah, ensuring aliases map to canonical building IDs.
+- Geospatial filter 24: find properties within boundary_geom of Business Bay and completion `unknown`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 24: return buildings within 1km of a given point with completion `unknown`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 24: show the full path (community ? district ? project ? cluster ? building) for units in Business Bay, ensuring aliases map to canonical building IDs.
+- Geospatial filter 25: find properties within boundary_geom of Jumeirah Village Circle and completion `ready`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 25: return buildings within 1km of a given point with completion `ready`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 25: show the full path (community ? district ? project ? cluster ? building) for units in Jumeirah Village Circle, ensuring aliases map to canonical building IDs.
+- Geospatial filter 26: find properties within boundary_geom of Arabian Ranches and completion `off_plan`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 26: return buildings within 1km of a given point with completion `off_plan`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 26: show the full path (community ? district ? project ? cluster ? building) for units in Arabian Ranches, ensuring aliases map to canonical building IDs.
+- Geospatial filter 27: find properties within boundary_geom of Dubai Hills Estate and completion `under_construction`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 27: return buildings within 1km of a given point with completion `under_construction`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 27: show the full path (community ? district ? project ? cluster ? building) for units in Dubai Hills Estate, ensuring aliases map to canonical building IDs.
+- Geospatial filter 28: find properties within boundary_geom of Jumeirah Lake Towers and completion `unknown`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 28: return buildings within 1km of a given point with completion `unknown`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 28: show the full path (community ? district ? project ? cluster ? building) for units in Jumeirah Lake Towers, ensuring aliases map to canonical building IDs.
+- Geospatial filter 29: find properties within boundary_geom of Al Barsha and completion `ready`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 29: return buildings within 1km of a given point with completion `ready`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 29: show the full path (community ? district ? project ? cluster ? building) for units in Al Barsha, ensuring aliases map to canonical building IDs.
+- Geospatial filter 30: find properties within boundary_geom of Bluewaters and completion `off_plan`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 30: return buildings within 1km of a given point with completion `off_plan`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 30: show the full path (community ? district ? project ? cluster ? building) for units in Bluewaters, ensuring aliases map to canonical building IDs.
+- Geospatial filter 31: find properties within boundary_geom of Dubai Marina and completion `under_construction`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 31: return buildings within 1km of a given point with completion `under_construction`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 31: show the full path (community ? district ? project ? cluster ? building) for units in Dubai Marina, ensuring aliases map to canonical building IDs.
+- Geospatial filter 32: find properties within boundary_geom of Downtown Dubai and completion `unknown`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 32: return buildings within 1km of a given point with completion `unknown`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 32: show the full path (community ? district ? project ? cluster ? building) for units in Downtown Dubai, ensuring aliases map to canonical building IDs.
+- Geospatial filter 33: find properties within boundary_geom of Palm Jumeirah and completion `ready`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 33: return buildings within 1km of a given point with completion `ready`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 33: show the full path (community ? district ? project ? cluster ? building) for units in Palm Jumeirah, ensuring aliases map to canonical building IDs.
+- Geospatial filter 34: find properties within boundary_geom of Business Bay and completion `off_plan`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 34: return buildings within 1km of a given point with completion `off_plan`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 34: show the full path (community ? district ? project ? cluster ? building) for units in Business Bay, ensuring aliases map to canonical building IDs.
+- Geospatial filter 35: find properties within boundary_geom of Jumeirah Village Circle and completion `under_construction`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 35: return buildings within 1km of a given point with completion `under_construction`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 35: show the full path (community ? district ? project ? cluster ? building) for units in Jumeirah Village Circle, ensuring aliases map to canonical building IDs.
+- Geospatial filter 36: find properties within boundary_geom of Arabian Ranches and completion `unknown`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 36: return buildings within 1km of a given point with completion `unknown`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 36: show the full path (community ? district ? project ? cluster ? building) for units in Arabian Ranches, ensuring aliases map to canonical building IDs.
+- Geospatial filter 37: find properties within boundary_geom of Dubai Hills Estate and completion `ready`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 37: return buildings within 1km of a given point with completion `ready`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 37: show the full path (community ? district ? project ? cluster ? building) for units in Dubai Hills Estate, ensuring aliases map to canonical building IDs.
+- Geospatial filter 38: find properties within boundary_geom of Jumeirah Lake Towers and completion `off_plan`, using ST_Within on properties.geom and districts.boundary_geom.
+- Nearby buildings 38: return buildings within 1km of a given point with completion `off_plan`, leveraging idx_buildings_geom and properties.geom for cross-checks.
+- Hierarchy trace 38: show the full path (community ? district ? project ? cluster ? building) for units in Jumeirah Lake Towers, ensuring aliases map to canonical building IDs.
+- Geospatial filter 39: find properties within boundary_geom of Al Barsha and completion `under_construction`, using ST_Within on properties.geom and districts.boundary_geom.

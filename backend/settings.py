@@ -5,7 +5,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal, Optional
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -60,37 +60,37 @@ class DatabaseSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     neon_db_url: Optional[str] = Field(None, validation_alias="NEON_DB_URL")
-    supabase_db_url: Optional[str] = Field(None, validation_alias="SUPABASE_DB_URL")
+    fallback_db_url: Optional[str] = Field(None, validation_alias=AliasChoices("SUPABASE_DB_URL", "FALLBACK_DB_URL"))
     pool_size: int = Field(10, validation_alias="DB_POOL_SIZE")
 
     @property
     def primary_db_url(self) -> str:
         if self.neon_db_url:
             return self.neon_db_url
-        if self.supabase_db_url:
-            return self.supabase_db_url
+        if self.fallback_db_url:
+            return self.fallback_db_url
         raise ValueError("No database URL configured (NEON_DB_URL or SUPABASE_DB_URL)")
 
 
-class SupabaseSettings(BaseSettings):
+class NeonRestSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    url: str = Field(..., validation_alias="SUPABASE_URL")
-    service_role_key: str = Field(..., validation_alias="SUPABASE_SERVICE_ROLE_KEY")
+    url: str = Field(..., validation_alias=AliasChoices("NEON_REST_URL", "SUPABASE_URL"))
+    service_role_key: str = Field(..., validation_alias=AliasChoices("NEON_SERVICE_ROLE_KEY", "SUPABASE_SERVICE_ROLE_KEY"))
 
 
 class EmbeddingSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    model: str = Field("text-embedding-3-small", validation_alias="OPENAI_EMBEDDING_MODEL")
-    dimensions: int = Field(1536, validation_alias="OPENAI_EMBEDDING_DIM")
+    model: str = Field("models/text-embedding-004", validation_alias="EMBEDDING_MODEL")
+    dimensions: int = Field(1536, validation_alias="EMBEDDING_DIM")
 
 
 class AuthSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     enabled: bool = Field(False, validation_alias="AUTH_ENABLED")
-    jwt_secret: str = Field("dev-secret-change-me", validation_alias="SUPABASE_JWT_SECRET")
+    jwt_secret: str = Field("dev-secret-change-me", validation_alias=AliasChoices("NEON_JWT_SECRET", "SUPABASE_JWT_SECRET"))
     jwt_audience: Optional[str] = Field("authenticated", validation_alias="AUTH_JWT_AUDIENCE")
     jwt_algorithms: tuple[str, ...] = Field(("HS256",), validation_alias="AUTH_JWT_ALGORITHMS")
     magic_link_redirect_url: Optional[str] = Field(None, validation_alias="AUTH_MAGIC_LINK_REDIRECT")
@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     api: APISettings = Field(default_factory=APISettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
-    supabase: SupabaseSettings = Field(default_factory=SupabaseSettings)
+    neon_rest: NeonRestSettings = Field(default_factory=NeonRestSettings)
     embedding: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
 

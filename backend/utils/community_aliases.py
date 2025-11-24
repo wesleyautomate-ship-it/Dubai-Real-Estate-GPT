@@ -2,7 +2,7 @@
 Alias Resolution Helpers
 
 Handles community and building name variations and synonyms.
-Prefers cached Supabase aliases, with rich static fallbacks for common areas.
+Prefers cached Neon aliases (Supabase-compatible), with rich static fallbacks for common areas.
 """
 
 from __future__ import annotations
@@ -13,12 +13,12 @@ from typing import Dict, Optional
 
 import requests
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+NEON_REST_URL = os.getenv("NEON_REST_URL") or os.getenv("NEON_REST_URL")
+NEON_SERVICE_ROLE_KEY = os.getenv("NEON_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 HEADERS = {
-    "apikey": SUPABASE_KEY or "",
-    "Authorization": f"Bearer {SUPABASE_KEY}" if SUPABASE_KEY else "",
+    "apikey": NEON_SERVICE_ROLE_KEY or "",
+    "Authorization": f"Bearer {NEON_SERVICE_ROLE_KEY}" if NEON_SERVICE_ROLE_KEY else "",
 }
 
 # Static alias mappings (seed coverage so lookups work without remote fetch)
@@ -128,11 +128,11 @@ def lookup_alias_in_db(alias: str, alias_type: str = "community") -> Optional[st
     """
     Slow-path lookup in Supabase aliases table (partial case-insensitive match).
     """
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not NEON_REST_URL or not NEON_SERVICE_ROLE_KEY:
         return None
 
     try:
-        url = f"{SUPABASE_URL}/rest/v1/aliases"
+        url = f"{NEON_REST_URL}/rest/v1/aliases"
         params = {
             "select": "canonical",
             "alias": f"ilike.{alias}",
@@ -174,11 +174,11 @@ def get_all_aliases(name: str, alias_type: str = "community") -> list:
     """
     Get all known aliases for a canonical community or building name.
     """
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not NEON_REST_URL or not NEON_SERVICE_ROLE_KEY:
         return []
 
     try:
-        url = f"{SUPABASE_URL}/rest/v1/aliases"
+        url = f"{NEON_REST_URL}/rest/v1/aliases"
         params = {
             "select": "alias,confidence",
             "canonical": f"eq.{name}",
@@ -211,9 +211,9 @@ def _get_alias_map(alias_type: str) -> Dict[str, str]:
 
         alias_map = dict(STATIC_ALIASES_BY_TYPE.get(alias_type, {}))
 
-        if SUPABASE_URL and SUPABASE_KEY:
+        if NEON_REST_URL and NEON_SERVICE_ROLE_KEY:
             try:
-                url = f"{SUPABASE_URL}/rest/v1/aliases"
+                url = f"{NEON_REST_URL}/rest/v1/aliases"
                 params = {
                     "select": "alias,canonical",
                     "type": f"eq.{alias_type}",

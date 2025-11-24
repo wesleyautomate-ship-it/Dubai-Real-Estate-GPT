@@ -57,7 +57,7 @@
 - `backend/core/tools.py`
 - `backend/system_prompt.txt`
 - `docs/CHAT_AGENT_IMPLEMENTATION.md`
-- `QUICKSTART.md`
+- `docs/ARCHITECTURE.md`
 - `AGENT_COMPLETE.md`
 
 ---

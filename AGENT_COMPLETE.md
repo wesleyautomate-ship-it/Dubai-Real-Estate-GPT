@@ -53,11 +53,11 @@ Human-friendly Response
    - Security guidelines
    - Testing checklist
 
-5. **`QUICKSTART.md`** ✅
-   - User-friendly setup guide
-   - Step-by-step installation
-   - Troubleshooting tips
-   - Cost estimates
+5. **`docs/ARCHITECTURE.md`** ✅
+   - System overview (ingestion → backend → frontend)
+   - Execution order for ingestion, API, and UI
+   - Links to the RAG/chat documentation
+   - Frontend ↔ backend communication summary
 
 6. **`AGENT_COMPLETE.md`** ✅ (this file)
    - Implementation summary
@@ -295,7 +295,7 @@ async def chat(req: ChatRequest):
 
 All documentation is in `docs/` folder:
 
-1. **QUICKSTART.md** - Setup and testing guide (START HERE)
+1. **docs/ARCHITECTURE.md** - Architecture overview + startup guide (START HERE)
 2. **CHAT_AGENT_IMPLEMENTATION.md** - Technical deep dive
 3. **PROJECT_STRUCTURE.md** - Codebase organization
 4. **REORGANIZATION_COMPLETE.md** - Migration summary
@@ -379,7 +379,7 @@ All documentation is in `docs/` folder:
 
 ### Getting Help:
 
-1. Check `QUICKSTART.md` for setup instructions
+1. Check `docs/ARCHITECTURE.md` for setup instructions
 2. Review error messages in terminal
 3. Test individual components:
    - Tools: `python backend/core/tools.py`

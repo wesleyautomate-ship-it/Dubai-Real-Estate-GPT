@@ -9,7 +9,7 @@ from datetime import datetime
 from tqdm import tqdm
 
 from backend.config import EMBEDDING_MODEL, EMBEDDING_DIMENSIONS
-from backend.supabase_client import select, insert, call_rpc
+from backend.neon_client import select, insert, call_rpc
 from backend.embeddings import embed_batch
 
 

@@ -8,11 +8,12 @@ import time
 import uuid
 import logging
 from typing import Any, Dict, List, Optional
+from datetime import date
 
 from fastapi import APIRouter, HTTPException, Query
 
 from backend.embeddings import embed_text
-from backend.supabase_client import call_rpc, select
+from backend.neon_client import call_rpc, select
 from backend.utils.community_aliases import (
     infer_community_from_text,
     resolve_building_alias,
@@ -22,6 +23,18 @@ from backend.utils.property_query_parser import parse_property_query
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+ORDER_BY_CHOICES = {
+    "relevance",
+    "date_desc",
+    "date_asc",
+    "price_desc",
+    "price_asc",
+    "size_desc",
+    "size_asc",
+    "bedrooms_desc",
+    "bedrooms_asc",
+}
 
 
 def _add_filter(filters: Dict[str, Any], field: str, expression: str) -> None:
@@ -44,6 +57,8 @@ def _build_transaction_filters(
     min_size: Optional[int],
     max_size: Optional[int],
     bedrooms: Optional[int],
+    date_from: Optional[date],
+    date_to: Optional[date],
 ) -> Dict[str, Any]:
     filters: Dict[str, Any] = {}
 
@@ -64,6 +79,10 @@ def _build_transaction_filters(
         _add_filter(filters, "size_sqft", f"lte.{max_size}")
     if bedrooms is not None:
         _add_filter(filters, "bedrooms", f"eq.{bedrooms}")
+    if date_from is not None:
+        _add_filter(filters, "transaction_date", f"gte.{date_from.isoformat()}")
+    if date_to is not None:
+        _add_filter(filters, "transaction_date", f"lte.{date_to.isoformat()}")
 
     return filters
 
@@ -94,6 +113,28 @@ def _filter_semantic_results(
     return filtered or results  # fall back to original if filters knock out everything
 
 
+def _sort_results(results: List[Dict[str, Any]], order_by: str) -> List[Dict[str, Any]]:
+    """Sort results according to client-selected preference."""
+    if not results or order_by == "relevance" or order_by not in ORDER_BY_CHOICES:
+        return results
+
+    reverse = order_by.endswith("desc")
+    key_name = order_by.split("_", 1)[0]
+
+    def _key(row: Dict[str, Any]) -> Any:
+        if key_name == "date":
+            return row.get("transaction_date") or row.get("last_transaction_date") or date.min
+        if key_name == "price":
+            return row.get("price_aed") or row.get("price") or 0
+        if key_name == "size":
+            return row.get("size_sqft") or row.get("size_sqm") or 0
+        if key_name == "bedrooms":
+            return row.get("bedrooms") or 0
+        return row.get("score", 0)
+
+    return sorted(results, key=_key, reverse=reverse)
+
+
 @router.get("/search")
 async def search_properties(
     q: str = Query(..., description="Natural language search query", min_length=1, max_length=500),
@@ -105,8 +146,11 @@ async def search_properties(
     bedrooms: Optional[int] = Query(None, description="Number of bedrooms", ge=0),
     min_price: Optional[float] = Query(None, description="Minimum price in AED", ge=0),
     max_price: Optional[float] = Query(None, description="Maximum price in AED", ge=0),
+    transaction_date_from: Optional[date] = Query(None, description="Earliest transaction date (YYYY-MM-DD)"),
+    transaction_date_to: Optional[date] = Query(None, description="Latest transaction date (YYYY-MM-DD)"),
     limit: int = Query(12, description="Maximum results to return", ge=1, le=50),
     threshold: float = Query(0.70, description="Similarity threshold (0-1)", ge=0.0, le=1.0),
+    order_by: str = Query("relevance", description="Sort order", regex="^(relevance|date_(asc|desc)|price_(asc|desc)|size_(asc|desc)|bedrooms_(asc|desc))$"),
     provider: Optional[str] = Query(None, description="LLM provider used by caller"),
 ):
     """
@@ -156,6 +200,7 @@ async def search_properties(
 
             results = await call_rpc("semantic_search_chunks", rpc_payload)
             results = _filter_semantic_results(results, building_filter, unit_filter)
+            results = _sort_results(results, order_by)
 
             if not results:
                 use_fallback = True
@@ -172,14 +217,28 @@ async def search_properties(
                 min_size,
                 max_size,
                 bedrooms,
+                transaction_date_from,
+                transaction_date_to,
             )
+
+            order_clause = "transaction_date.desc"
+            if order_by == "date_asc":
+                order_clause = "transaction_date.asc"
+            elif order_by == "price_desc":
+                order_clause = "price.desc"
+            elif order_by == "price_asc":
+                order_clause = "price.asc"
+            elif order_by == "size_desc":
+                order_clause = "size_sqft.desc"
+            elif order_by == "size_asc":
+                order_clause = "size_sqft.asc"
 
             tx_results = await select(
                 "transactions",
-                select_fields="unit,building,community,buyer_name,buyer_phone,price,size_sqft,bedrooms,property_type",
+                select_fields="unit,building,community,buyer_name,buyer_phone,price,size_sqft,bedrooms,property_type,transaction_date",
                 filters=filters or None,
                 limit=limit,
-                order="transaction_date.desc",
+                order=order_clause,
             )
 
             results = [
@@ -195,10 +254,12 @@ async def search_properties(
                     "price_aed": tx.get("price"),
                     "owner_name": tx.get("buyer_name") or "N/A",
                     "owner_phone": tx.get("buyer_phone") or "N/A",
+                    "transaction_date": tx.get("transaction_date"),
                     "content": f"{tx.get('unit')} at {tx.get('building')}, {tx.get('community')} - {tx.get('property_type')}",
                 }
                 for tx in tx_results
             ]
+            results = _sort_results(results, order_by)
 
         formatted_results = []
         for row in results:
@@ -225,8 +286,6 @@ async def search_properties(
 
         elapsed_ms = round((time.time() - start_time) * 1000, 2)
 
-        elapsed_ms = round((time.time() - start_time) * 1000, 2)
-
         response_payload = {
             "results": formatted_results,
             "query": q,
@@ -243,6 +302,9 @@ async def search_properties(
                 "min_price": min_price,
                 "max_price": max_price,
                 "threshold": threshold,
+                "transaction_date_from": transaction_date_from,
+                "transaction_date_to": transaction_date_to,
+                "order_by": order_by,
             },
             "used_fallback": use_fallback,
             "request_id": request_id,

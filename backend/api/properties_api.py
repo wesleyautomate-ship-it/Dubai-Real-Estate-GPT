@@ -3,7 +3,7 @@ Properties API - Get detailed property information
 """
 
 from fastapi import APIRouter, HTTPException, Path
-from backend.supabase_client import select
+from backend.neon_client import select
 
 router = APIRouter()
 INSTITUTIONAL_TYPES = {"developer", "bank", "lender", "government"}

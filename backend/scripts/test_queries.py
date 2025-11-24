@@ -7,7 +7,7 @@ import asyncio
 import sys
 from datetime import datetime
 
-from backend.supabase_client import call_rpc
+from backend.neon_client import call_rpc
 from backend.embeddings import embed_text
 
 

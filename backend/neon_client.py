@@ -1,21 +1,21 @@
 """
-Supabase REST API Client
-Async httpx-based client for Supabase REST and RPC calls
+Neon REST API Client (PostgREST-style)
+Async httpx-based client for RPC and table calls. Supports legacy Supabase env vars via aliases.
 """
 
 import httpx
 from typing import Dict, Any, Optional, List
-from backend.config import SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+from backend.config import NEON_REST_URL, NEON_SERVICE_ROLE_KEY
 
 # Singleton httpx client
 _client: Optional[httpx.AsyncClient] = None
 
 
 def get_headers() -> Dict[str, str]:
-    """Get Supabase API headers"""
+    """Get Neon REST API headers"""
     return {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": NEON_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {NEON_SERVICE_ROLE_KEY}",
         "Content-Type": "application/json",
         "Prefer": "return=representation"
     }
@@ -26,7 +26,7 @@ async def get_client() -> httpx.AsyncClient:
     global _client
     if _client is None:
         _client = httpx.AsyncClient(
-            base_url=f"{SUPABASE_URL}/rest/v1",
+            base_url=f"{NEON_REST_URL}/rest/v1",
             headers=get_headers(),
             timeout=httpx.Timeout(15.0, connect=5.0, read=15.0, write=15.0)
         )
@@ -43,7 +43,7 @@ async def close_client():
 
 async def call_rpc(name: str, params: Dict[str, Any]) -> Any:
     """
-    Call a Supabase RPC function
+    Call a Neon RPC function
     
     Args:
         name: RPC function name
@@ -73,7 +73,7 @@ async def select(
     offset: Optional[int] = None
 ) -> List[Dict[str, Any]]:
     """
-    Query a Supabase table
+    Query a Neon table
     
     Args:
         table: Table name
@@ -146,7 +146,7 @@ async def insert(
     data: Dict[str, Any] | List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
     """
-    Insert row(s) into a Supabase table
+    Insert row(s) into a Neon table
     
     Args:
         table: Table name
@@ -167,7 +167,7 @@ async def upsert(
     on_conflict: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
-    Upsert row(s) into a Supabase table
+    Upsert row(s) into a Neon table
     
     Args:
         table: Table name
@@ -197,7 +197,7 @@ async def update(
     prefer_return: str | None = None,
 ) -> List[Dict[str, Any]]:
     """
-    Update rows in a Supabase table
+    Update rows in a Neon table
     
     Args:
         table: Table name
@@ -234,7 +234,7 @@ async def delete(
     table: str,
     filters: Dict[str, Any],
 ) -> bool:
-    """Delete rows from a Supabase table."""
+    """Delete rows from a Neon table."""
 
     client = await get_client()
     params = {}
@@ -251,7 +251,7 @@ async def delete(
 
 async def health_check() -> bool:
     """
-    Check if Supabase is reachable
+    Check if Neon REST endpoint is reachable
     
     Returns:
         True if healthy, False otherwise

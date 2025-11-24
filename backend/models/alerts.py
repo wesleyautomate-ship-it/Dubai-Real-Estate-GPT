@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from backend.supabase_client import delete, insert, select
+from backend.neon_client import delete, insert, select
 
 _ALERTS_TABLE = "alerts"
 

@@ -14,9 +14,9 @@ from openai import OpenAI
 
 load_dotenv()
 
-# Configuration
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+# Configuration (Neon REST; falls back to Neon env vars for compatibility)
+NEON_REST_URL = os.getenv("NEON_REST_URL") or os.getenv("NEON_REST_URL")
+NEON_SERVICE_ROLE_KEY = os.getenv("NEON_SERVICE_ROLE_KEY") or os.getenv("NEON_SERVICE_ROLE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Embedding model settings
@@ -33,11 +33,11 @@ def fetch_properties_without_embeddings(limit: int = 1000) -> List[Dict[str, Any
     Fetch properties that don't have embeddings yet
     """
     headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": NEON_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {NEON_SERVICE_ROLE_KEY}",
     }
     
-    url = f"{SUPABASE_URL}/rest/v1/properties"
+    url = f"{NEON_REST_URL}/rest/v1/properties"
     params = {
         "select": "id,community,building,unit,type,bedrooms,bathrooms,size_sqft,last_price",
         "description_embedding": "is.null",
@@ -116,13 +116,13 @@ def update_property_embedding(property_id: str, embedding: List[float], max_retr
     Update a property with its embedding (with retry logic)
     """
     headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": NEON_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {NEON_SERVICE_ROLE_KEY}",
         "Content-Type": "application/json",
         "Prefer": "return=minimal"
     }
     
-    url = f"{SUPABASE_URL}/rest/v1/properties"
+    url = f"{NEON_REST_URL}/rest/v1/properties"
     params = {"id": f"eq.{property_id}"}
     
     payload = {
@@ -184,9 +184,9 @@ def main():
     print("="*70 + "\n")
     
     # Validate configuration
-    if not all([SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, OPENAI_API_KEY]):
+    if not all([NEON_REST_URL, NEON_SERVICE_ROLE_KEY, OPENAI_API_KEY]):
         print("❌ Error: Missing required environment variables")
-        print("   Required: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, OPENAI_API_KEY")
+        print("   Required: NEON_REST_URL, NEON_SERVICE_ROLE_KEY, OPENAI_API_KEY")
         sys.exit(1)
     
     print("📊 Configuration:")
@@ -268,11 +268,11 @@ def main():
     print("🔍 Verifying embedding stats...")
     try:
         headers = {
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "apikey": NEON_SERVICE_ROLE_KEY,
+            "Authorization": f"Bearer {NEON_SERVICE_ROLE_KEY}",
             "Content-Type": "application/json"
         }
-        url = f"{SUPABASE_URL}/rest/v1/rpc/get_embedding_stats"
+        url = f"{NEON_REST_URL}/rest/v1/rpc/get_embedding_stats"
         response = requests.post(url, headers=headers, json={}, timeout=10)
         
         if response.status_code == 200:

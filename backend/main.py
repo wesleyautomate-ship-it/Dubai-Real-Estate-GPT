@@ -35,11 +35,11 @@ from backend.config import (
     GEMINI_API_KEY,
     LLM_PROVIDER,
     OPENAI_API_KEY,
-    SUPABASE_SERVICE_ROLE_KEY,
+    NEON_SERVICE_ROLE_KEY,
 )
 from backend.logging_config import setup_logging
 from backend.settings import get_settings
-from backend.supabase_client import close_client, get_client, call_rpc, health_check as supabase_health_check
+from backend.neon_client import close_client, get_client, call_rpc, health_check as neon_health_check
 
 try:  # Optional tracing dependencies
     from opentelemetry import trace
@@ -256,10 +256,10 @@ async def health_check():
 
     # Supabase health
     try:
-        supabase_ok = await supabase_health_check()
-        checks["database"].update({"supabase": "connected" if supabase_ok else "error"})
+        neon_ok = await neon_health_check()
+        checks["database"].update({"neon_rest": "connected" if neon_ok else "error"})
     except Exception as exc:
-        checks["database"].update({"supabase": f"error: {exc}"})
+        checks["database"].update({"neon_rest": f"error: {exc}"})
         checks["status"] = "degraded"
 
     try:

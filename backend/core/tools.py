@@ -12,7 +12,7 @@ from rapidfuzz import process, fuzz
 
 from backend.config import OPENAI_API_KEY
 from backend.core.analytics_engine import AnalyticsEngine
-from backend.supabase_client import call_rpc
+from backend.neon_client import call_rpc
 from backend.utils.community_aliases import resolve_community_alias
 
 # Analytics engine instance

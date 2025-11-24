@@ -19,8 +19,8 @@ Generates OpenAI text embeddings for property descriptions to enable semantic se
 Create a `.env` file in the project root or set these variables:
 
 ```bash
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+NEON_REST_URL=https://your-project.neon.tech  # or SUPABASE_URL for compatibility
+NEON_SERVICE_ROLE_KEY=your_service_role_key
 OPENAI_API_KEY=sk-proj-your_openai_key
 ```
 

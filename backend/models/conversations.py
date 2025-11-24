@@ -1,11 +1,11 @@
-"""Conversation persistence helpers backed by Supabase tables."""
+"""Conversation persistence helpers backed by Neon tables."""
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from backend.supabase_client import delete as supabase_delete
-from backend.supabase_client import insert, select, update
+from backend.neon_client import delete as neon_delete
+from backend.neon_client import insert, select, update
 
 # Table names
 _CONVERSATIONS_TABLE = "conversations"
@@ -142,5 +142,5 @@ async def add_message(
 
 async def delete_conversation(conversation_id: str) -> bool:
     # Delete messages first to avoid orphaned rows if cascading is disabled
-    await supabase_delete(_MESSAGES_TABLE, filters={"conversation_id": conversation_id})
-    return await supabase_delete(_CONVERSATIONS_TABLE, filters={"id": conversation_id})
+    await neon_delete(_MESSAGES_TABLE, filters={"conversation_id": conversation_id})
+    return await neon_delete(_CONVERSATIONS_TABLE, filters={"id": conversation_id})

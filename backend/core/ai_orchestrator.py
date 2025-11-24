@@ -21,13 +21,13 @@ from backend.core.analytics_engine import AnalyticsEngine
 from backend.utils.community_aliases import resolve_community_alias
 from backend.utils.phone_utils import normalize_phone
 
-# Supabase configuration
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+# Neon REST configuration (falls back to Supabase env vars for compatibility)
+NEON_REST_URL = os.getenv("NEON_REST_URL") or os.getenv("NEON_REST_URL")
+NEON_SERVICE_ROLE_KEY = os.getenv("NEON_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
 HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "apikey": NEON_SERVICE_ROLE_KEY,
+    "Authorization": f"Bearer {NEON_SERVICE_ROLE_KEY}",
     "Content-Type": "application/json"
 }
 
@@ -187,7 +187,7 @@ class RealEstateAI:
         unit = self._extract_unit(query)
         
         # Query v_current_owner
-        url = f"{SUPABASE_URL}/rest/v1/v_current_owner"
+        url = f"{NEON_REST_URL}/rest/v1/v_current_owner"
         params = {
             "select": "*",
             "limit": "1"
@@ -233,7 +233,7 @@ class RealEstateAI:
         unit = self._extract_unit(query)
         
         # Use RPC function or query transactions table
-        url = f"{SUPABASE_URL}/rest/v1/transactions"
+        url = f"{NEON_REST_URL}/rest/v1/transactions"
         params = {
             "select": "transaction_date,seller_name,buyer_name,price",
             "order": "transaction_date.desc",
@@ -276,7 +276,7 @@ class RealEstateAI:
         size_range = self._extract_size_range(query)
         
         # Query properties table
-        url = f"{SUPABASE_URL}/rest/v1/properties"
+        url = f"{NEON_REST_URL}/rest/v1/properties"
         params = {
             "select": "community,building,unit,type,bedrooms,size_sqft,owner_id",
             "limit": "50"
@@ -327,7 +327,7 @@ class RealEstateAI:
             phone = normalize_phone(phone)
         
         # Use owner_portfolio RPC or query
-        url = f"{SUPABASE_URL}/rest/v1/rpc/owner_portfolio"
+        url = f"{NEON_REST_URL}/rest/v1/rpc/owner_portfolio"
         payload = {}
         
         if owner_name:
@@ -374,7 +374,7 @@ class RealEstateAI:
             community = resolve_community_alias(community)
         
         # Use RPC function
-        url = f"{SUPABASE_URL}/rest/v1/rpc/market_stats"
+        url = f"{NEON_REST_URL}/rest/v1/rpc/market_stats"
         payload = {"p_community": community}
         
         resp = requests.post(url, json=payload, headers=HEADERS)
@@ -416,7 +416,7 @@ class RealEstateAI:
             community = resolve_community_alias(community)
         
         # Use find_comparables RPC
-        url = f"{SUPABASE_URL}/rest/v1/rpc/find_comparables"
+        url = f"{NEON_REST_URL}/rest/v1/rpc/find_comparables"
         payload = {
             "p_community": community,
             "p_bedrooms": bedrooms,
@@ -501,7 +501,7 @@ class RealEstateAI:
             community = resolve_community_alias(community)
         
         # Use top_investors RPC
-        url = f"{SUPABASE_URL}/rest/v1/rpc/top_investors"
+        url = f"{NEON_REST_URL}/rest/v1/rpc/top_investors"
         payload = {
             "p_community": community,
             "p_limit": 10,
@@ -627,7 +627,7 @@ class RealEstateAI:
         # Get stats for each
         comparison_data = []
         for community in communities:
-            url = f"{SUPABASE_URL}/rest/v1/rpc/market_stats"
+            url = f"{NEON_REST_URL}/rest/v1/rpc/market_stats"
             payload = {"p_community": community}
             resp = requests.post(url, json=payload, headers=HEADERS)
             

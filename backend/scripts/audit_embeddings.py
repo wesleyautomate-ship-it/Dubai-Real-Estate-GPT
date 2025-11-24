@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 from typing import Dict, Any
 
-from backend.supabase_client import call_rpc
+from backend.neon_client import call_rpc
 
 
 async def fetch_db_stats() -> Dict[str, Any]:

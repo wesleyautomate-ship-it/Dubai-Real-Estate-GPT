@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Request
 
 from backend.api.common import ApiError, error_response, success_response
-from backend.supabase_client import call_rpc
+from backend.neon_client import call_rpc
 
 router = APIRouter()
 

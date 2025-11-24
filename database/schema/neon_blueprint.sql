@@ -444,6 +444,51 @@ CREATE INDEX IF NOT EXISTS idx_chunks_embedding
     ON chunks USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 100);
 
+-- RAG-focused tables for document retrieval and chat context -----------------
+CREATE TABLE IF NOT EXISTS rag_documents (
+    id bigserial PRIMARY KEY,
+    property_id bigint REFERENCES properties(id) ON DELETE CASCADE,
+    title text NOT NULL,
+    content text NOT NULL,
+    embedding vector(1536),
+    embedding_model text,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    source data_source DEFAULT 'unknown',
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_documents_property
+    ON rag_documents (property_id);
+
+CREATE INDEX IF NOT EXISTS idx_rag_documents_embedding
+    ON rag_documents USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+CREATE TABLE IF NOT EXISTS rag_prompt_templates (
+    id bigserial PRIMARY KEY,
+    name text NOT NULL UNIQUE,
+    description text,
+    template text NOT NULL,
+    required_fields text[] NOT NULL DEFAULT '{}',
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS rag_conversations (
+    id bigserial PRIMARY KEY,
+    property_id bigint REFERENCES properties(id) ON DELETE SET NULL,
+    prompt_template_id bigint REFERENCES rag_prompt_templates(id) ON DELETE SET NULL,
+    user_input text,
+    assistant_response text,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_rag_conversations_property
+    ON rag_conversations (property_id);
+
 -- Views (examples) ----------------------------------------------------------
 CREATE OR REPLACE VIEW v_multi_property_owners AS
 SELECT
@@ -472,3 +517,61 @@ FROM leads l
 LEFT JOIN lead_actions la ON la.lead_id = l.id
 WHERE l.status IN ('hot', 'qualified')
 GROUP BY l.id;
+
+CREATE OR REPLACE VIEW v_chat_context AS
+SELECT
+    p.id AS property_id,
+    c.name AS community_name,
+    d.name AS district_name,
+    pr.name AS project_name,
+    b.name AS building_name,
+    b.tower_name,
+    b.completion AS building_completion,
+    p.status AS property_status,
+    p.property_type,
+    p.usage,
+    p.size_sqm,
+    p.size_sqft,
+    p.bedrooms,
+    p.bathrooms,
+    jsonb_build_object(
+        'owner_id', owner_data.owner_id,
+        'name', owner_data.owner_name,
+        'nationality', owner_data.owner_nationality
+    ) AS owner_info,
+    jsonb_build_object(
+        'date', latest_tx.event_date,
+        'price', latest_tx.price,
+        'season', latest_tx.completion,
+        'usage', latest_tx.usage
+    ) AS latest_transaction,
+    jsonb_build_object(
+        'project_source', pr.source,
+        'building_tower', b.tower_name,
+        'property_metadata', p.metadata
+    ) AS metadata_context
+FROM properties p
+LEFT JOIN communities c ON p.community_id = c.id
+LEFT JOIN districts d ON p.district_id = d.id
+LEFT JOIN projects pr ON p.project_id = pr.id
+LEFT JOIN buildings b ON p.building_id = b.id
+LEFT JOIN LATERAL (
+    SELECT o.id AS owner_id,
+           o.name AS owner_name,
+           o.nationality AS owner_nationality
+    FROM property_owners po
+    JOIN owners o ON o.id = po.owner_id
+    WHERE po.property_id = p.id
+    ORDER BY po.is_primary DESC NULLS LAST
+    LIMIT 1
+) owner_data ON true
+LEFT JOIN LATERAL (
+    SELECT t.event_date,
+           t.price,
+           t.completion,
+           t.usage
+    FROM transactions t
+    WHERE t.property_id = p.id
+    ORDER BY t.event_date DESC
+    LIMIT 1
+) latest_tx ON true;
