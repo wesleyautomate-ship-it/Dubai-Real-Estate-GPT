@@ -12,13 +12,13 @@ try:
 except Exception:
     pass
 
-DB_URL = os.getenv("SUPABASE_DB_URL")
+DB_URL = os.getenv("NEON_DB_URL") or os.getenv("SUPABASE_DB_URL")
 
 def main():
     if not DB_URL:
         print(json.dumps({
             "ok": False,
-            "error": "SUPABASE_DB_URL not set in environment. Please add it to .env",
+            "error": "NEON_DB_URL (or SUPABASE_DB_URL) not set in environment.",
         }))
         sys.exit(1)
 

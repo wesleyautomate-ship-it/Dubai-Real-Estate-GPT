@@ -5,6 +5,8 @@ Search API - Semantic Property Search Endpoint
 from __future__ import annotations
 
 import time
+import uuid
+import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -19,6 +21,7 @@ from backend.utils.community_aliases import (
 from backend.utils.property_query_parser import parse_property_query
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def _add_filter(filters: Dict[str, Any], field: str, expression: str) -> None:
@@ -104,11 +107,13 @@ async def search_properties(
     max_price: Optional[float] = Query(None, description="Maximum price in AED", ge=0),
     limit: int = Query(12, description="Maximum results to return", ge=1, le=50),
     threshold: float = Query(0.70, description="Similarity threshold (0-1)", ge=0.0, le=1.0),
+    provider: Optional[str] = Query(None, description="LLM provider used by caller"),
 ):
     """
     Natural-language property search with semantic embeddings and SQL fallback.
     """
     start_time = time.time()
+    request_id = str(uuid.uuid4())
 
     try:
         parsed_location = parse_property_query(q)
@@ -220,11 +225,14 @@ async def search_properties(
 
         elapsed_ms = round((time.time() - start_time) * 1000, 2)
 
-        return {
+        elapsed_ms = round((time.time() - start_time) * 1000, 2)
+
+        response_payload = {
             "results": formatted_results,
             "query": q,
             "total": len(formatted_results),
             "timing_ms": elapsed_ms,
+            "provider": provider or "openai",
             "filters_applied": {
                 "community": community_filter,
                 "building": building_filter,
@@ -237,9 +245,29 @@ async def search_properties(
                 "threshold": threshold,
             },
             "used_fallback": use_fallback,
+            "request_id": request_id,
         }
+
+        logger.info(
+            "[search] request_id=%s provider=%s intent=search total=%s fallback=%s latency_ms=%.2f",
+            request_id,
+            provider or "openai",
+            len(formatted_results),
+            use_fallback,
+            elapsed_ms,
+        )
+
+        return response_payload
 
     except HTTPException:
         raise
     except Exception as exc:
+        elapsed_ms = round((time.time() - start_time) * 1000, 2)
+        logger.error(
+            "[search] request_id=%s provider=%s error=%s latency_ms=%.2f",
+            request_id,
+            provider or "openai",
+            exc,
+            elapsed_ms,
+        )
         raise HTTPException(status_code=500, detail=f"Search failed: {exc}") from exc

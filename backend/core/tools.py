@@ -308,55 +308,49 @@ def semantic_search(query: str,
     """
     try:
         from openai import OpenAI
-        
-        if not OPENAI_API_KEY:
-            return {
-                "success": False,
-                "error": "OPENAI_API_KEY not configured"
-            }
-        
+    except ImportError:
+        return {"success": False, "error": "openai package not installed"}
+
+    if not OPENAI_API_KEY:
+        return {"success": False, "error": "OPENAI_API_KEY not configured"}
+
+    try:
         client = OpenAI(api_key=OPENAI_API_KEY)
-        
-        # Generate embedding for search query
-        response = client.embeddings.create(
-            model="text-embedding-ada-002",
-            input=query
-        )
+        response = client.embeddings.create(model="text-embedding-ada-002", input=query)
         query_embedding = response.data[0].embedding
-        
-        # Search via Supabase RPC
-        url = f"{SUPABASE_URL}/rest/v1/rpc/search_properties_semantic"
-        
-        payload = {
-            "query_embedding": query_embedding,
-            "match_threshold": match_threshold,
-            "match_count": limit,
-            "filter_community": filter_community,
-            "filter_min_price": filter_min_price,
-            "filter_max_price": filter_max_price,
-            "filter_bedrooms": filter_bedrooms
+    except Exception as exc:
+        return {"success": False, "error": f"Embedding generation failed: {exc}"}
+
+    payload = {
+        "query_embedding": query_embedding,
+        "match_threshold": match_threshold,
+        "match_count": limit,
+        "filter_community": filter_community,
+        "filter_min_price": filter_min_price,
+        "filter_max_price": filter_max_price,
+        "filter_bedrooms": filter_bedrooms,
+    }
+
+    try:
+        results = asyncio.run(call_rpc("search_properties_semantic", payload))
+        return {
+            "success": True,
+            "query": query,
+            "count": len(results),
+            "properties": results,
+            "filters_applied": {
+                "community": filter_community,
+                "min_price": filter_min_price,
+                "max_price": filter_max_price,
+                "bedrooms": filter_bedrooms,
+            },
         }
-        
-        try:
-            results = asyncio.run(call_rpc("search_properties_semantic", payload))
-            return {
-                "success": True,
-                "query": query,
-                "count": len(results),
-                "properties": results,
-                "filters_applied": {
-                    "community": filter_community,
-                    "min_price": filter_min_price,
-                    "max_price": filter_max_price,
-                    "bedrooms": filter_bedrooms
-                }
-            }
-        except Exception as exc:
-            return {
-                "success": False,
-                "error": f"Semantic search failed: {str(exc)}",
-                "note": "Make sure pgvector is enabled and search_properties_semantic RPC exists"
-            }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Semantic search failed: {exc}",
+            "note": "Make sure pgvector is enabled and search_properties_semantic RPC exists",
+        }
 
 
 # Tool schema definitions for OpenAI function calling

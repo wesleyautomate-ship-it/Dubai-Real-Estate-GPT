@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: dubai-real-estate-api
+    env: python
+    plan: starter
+    envVars:
+      - key: API_PORT
+        value: "8787"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_JSON
+        value: "true"
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT

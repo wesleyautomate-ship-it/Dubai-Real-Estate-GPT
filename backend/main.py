@@ -3,27 +3,98 @@ Dubai Real Estate Semantic Search API
 Main FastAPI application
 """
 
-import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 from pathlib import Path
 
-from backend.config import API_HOST, API_PORT
-from backend.supabase_client import get_client, close_client, call_rpc
-from backend.api import owners_api, search_api, properties_api, stats_api, chat_tools_api
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from prometheus_fastapi_instrumentator import Instrumentator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+import structlog
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from backend.api import (
+    auth_api,
+    conversations_api,
+    owners_api,
+    search_api,
+    properties_api,
+    stats_api,
+    chat_tools_api,
+    chat_endpoint,
+)
+from backend.api.common import ApiError, error_response
+from backend.api.middleware import auth_middleware, request_context_middleware
+from backend.config import (
+    API_HOST,
+    API_PORT,
+    GEMINI_API_KEY,
+    LLM_PROVIDER,
+    OPENAI_API_KEY,
+    SUPABASE_SERVICE_ROLE_KEY,
+)
+from backend.logging_config import setup_logging
+from backend.settings import get_settings
+from backend.supabase_client import close_client, get_client, call_rpc, health_check as supabase_health_check
+
+try:  # Optional tracing dependencies
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+except ImportError:  # pragma: no cover - tracing is optional
+    trace = None  # type: ignore
+    FastAPIInstrumentor = None  # type: ignore
+    OTLPSpanExporter = None  # type: ignore
+    TracerProvider = None  # type: ignore
+    BatchSpanProcessor = None  # type: ignore
+    ConsoleSpanExporter = None  # type: ignore
+    Resource = None  # type: ignore
+
+
+settings = get_settings()
+setup_logging(settings.logging.level, settings.logging.json)
+logger = structlog.get_logger(__name__)
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
+
+
+def _init_tracer(app: FastAPI) -> None:
+    if not settings.tracing.enabled or trace is None or TracerProvider is None:
+        logger.info("[tracing] OpenTelemetry disabled")
+        return
+
+    resource = Resource.create({"service.name": settings.tracing.service_name}) if Resource else None
+    tracer_provider = TracerProvider(resource=resource)
+
+    if settings.tracing.endpoint and OTLPSpanExporter is not None:
+        tracer_provider.add_span_processor(
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.tracing.endpoint))
+        )
+    else:
+        tracer_provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+
+    trace.set_tracer_provider(tracer_provider)
+
+    if FastAPIInstrumentor is not None:
+        FastAPIInstrumentor.instrument_app(app, tracer_provider=tracer_provider)
+        logger.info("[tracing] OpenTelemetry instrumentation enabled")
+
+
+def _init_metrics(app: FastAPI) -> None:
+    if not settings.metrics.enabled:
+        logger.info("[metrics] Prometheus instrumentation disabled")
+        return
+
+    Instrumentator().instrument(app).expose(app, endpoint=settings.metrics.endpoint)
+    logger.info("[metrics] Prometheus instrumentation enabled", endpoint=settings.metrics.endpoint)
 
 
 @asynccontextmanager
@@ -69,9 +140,50 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# Instrumentation
+_init_tracer(app)
+_init_metrics(app)
+
 # Add rate limiting
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# Middleware & exception handlers
+app.middleware("http")(auth_middleware)
+app.middleware("http")(request_context_middleware)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, dict):
+        code = str(detail.get("code", "http_error"))
+        message = str(detail.get("message", "Request failed."))
+        details = detail.get("details")
+    else:
+        code = "http_error"
+        message = str(detail) if detail else exc.__class__.__name__
+        details = detail if detail and not isinstance(detail, str) else None
+
+    return error_response(
+        request,
+        status_code=exc.status_code,
+        error=ApiError(code=code, message=message, details=details),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return error_response(
+        request,
+        status_code=422,
+        error=ApiError(
+            code="validation_error",
+            message="Invalid request payload.",
+            details=exc.errors(),
+        ),
+    )
 
 # CORS middleware
 app.add_middleware(
@@ -87,7 +199,10 @@ app.include_router(search_api.router, prefix="/api", tags=["Search"])
 app.include_router(properties_api.router, prefix="/api", tags=["Properties"])
 app.include_router(stats_api.router, prefix="/api", tags=["Statistics"])
 app.include_router(owners_api.router, prefix="/api", tags=["Owners"])
+app.include_router(conversations_api.router, prefix="/api", tags=["Conversations"])
 app.include_router(chat_tools_api.router, prefix="/api", tags=["Chat Tools"])
+app.include_router(chat_endpoint.router, prefix="/api", tags=["Chat"])
+app.include_router(auth_api.router, prefix="/api", tags=["Auth"])
 
 # Mount frontend static files
 frontend_path = Path(__file__).parent.parent / "frontend"
@@ -128,32 +243,48 @@ async def serve_chat():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Aggregated application health status."""
+
+    checks = {
+        "status": "healthy",
+        "database": {},
+        "llm": {},
+        "background_jobs": {},
+        "metrics": {"enabled": settings.metrics.enabled},
+        "tracing": {"enabled": settings.tracing.enabled},
+    }
+
+    # Supabase health
     try:
-        # Try db_stats first
-        try:
-            stats = await call_rpc("db_stats", {})
-            return {
-                "status": "healthy",
-                "database": "connected",
-                "stats": stats[0] if stats else None
-            }
-        except:
-            # Fallback to simple check
-            client = await get_client()
-            result = await client.table('properties').select('id', count='exact').limit(1).execute()
-            return {
-                "status": "healthy",
-                "database": "connected",
-                "note": "db_stats function not available, using basic check",
-                "properties_count": result.count if hasattr(result, 'count') else "unknown"
-            }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "database": "error",
-            "error": str(e)
-        }
+        supabase_ok = await supabase_health_check()
+        checks["database"].update({"supabase": "connected" if supabase_ok else "error"})
+    except Exception as exc:
+        checks["database"].update({"supabase": f"error: {exc}"})
+        checks["status"] = "degraded"
+
+    try:
+        stats = await call_rpc("db_stats", {})
+        if stats:
+            checks["database"].update({"stats": stats[0] if isinstance(stats, list) else stats})
+    except Exception as exc:
+        checks["database"].update({"stats_error": str(exc)})
+
+    # LLM provider health
+    llm_provider = settings.llm.provider
+    if llm_provider == "openai":
+        checks["llm"].update({"provider": "openai", "api_key_present": bool(settings.llm.openai_api_key)})
+        if not settings.llm.openai_api_key:
+            checks["status"] = "degraded"
+    elif llm_provider == "gemini":
+        checks["llm"].update({"provider": "gemini", "api_key_present": bool(settings.llm.gemini_api_key)})
+        if not settings.llm.gemini_api_key:
+            checks["status"] = "degraded"
+
+    # Background jobs (placeholder)
+    if settings.metrics.enabled:
+        checks["background_jobs"].update({"scheduler": "not_implemented"})
+
+    return checks
 
 
 if __name__ == "__main__":

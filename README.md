@@ -33,7 +33,7 @@ This system:
 2. Copy and run the entire `supabase_schema.sql` file
 3. Verify tables created: `transactions`, `owners`, `properties`, `aliases`
 
-### Step 3: Set Environment Variables
+### Step 3: Configure Environment Variables
 
 Run the setup script in PowerShell:
 
@@ -109,6 +109,28 @@ npm run dev
 ```
 
 The Vite dev server proxies `/api/*` calls to `http://localhost:8787`, so be sure the backend is running. Visit the printed URL (usually http://localhost:5173) to use the new UI.
+
+### Step 7: Run the API with Docker
+
+Build the backend image:
+
+```bash
+docker build -t dubai-real-estate-api .
+```
+
+Run locally (expects `.env` with Supabase + LLM secrets):
+
+```bash
+docker run --env-file .env -p 8787:8787 dubai-real-estate-api
+```
+
+Or use `docker-compose`:
+
+```bash
+docker compose up --build
+```
+
+Deployment manifests for Railway (`deploy/railway.json`) and Render (`deploy/render.yaml`) are provided; update environment variables in the respective dashboards before deploying.
 
 ## Project Structure
 

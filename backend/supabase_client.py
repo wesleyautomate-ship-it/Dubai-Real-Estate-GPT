@@ -28,7 +28,7 @@ async def get_client() -> httpx.AsyncClient:
         _client = httpx.AsyncClient(
             base_url=f"{SUPABASE_URL}/rest/v1",
             headers=get_headers(),
-            timeout=30.0
+            timeout=httpx.Timeout(15.0, connect=5.0, read=15.0, write=15.0)
         )
     return _client
 
@@ -130,9 +130,15 @@ async def select(
     if limit:
         params["limit"] = str(limit)
     
-    response = await client.get(f"/{table}", params=params)
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = await client.get(f"/{table}", params=params)
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        if exc.response is not None and exc.response.status_code == 404:
+            # Treat missing tables or rows as empty result sets instead of raising.
+            return []
+        raise
 
 
 async def insert(
@@ -222,6 +228,25 @@ async def update(
         return response.json()
     except Exception:
         return []
+
+
+async def delete(
+    table: str,
+    filters: Dict[str, Any],
+) -> bool:
+    """Delete rows from a Supabase table."""
+
+    client = await get_client()
+    params = {}
+    for col, val in filters.items():
+        if isinstance(val, str) and any(val.startswith(prefix) for prefix in ("eq.", "gt.", "lt.", "gte.", "lte.", "like.", "ilike.", "in.")):
+            params[col] = val
+        else:
+            params[col] = f"eq.{val}"
+
+    response = await client.delete(f"/{table}", params=params)
+    response.raise_for_status()
+    return response.status_code in (200, 204)
 
 
 async def health_check() -> bool:

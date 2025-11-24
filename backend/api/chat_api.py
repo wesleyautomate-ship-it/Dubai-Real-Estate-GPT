@@ -33,7 +33,7 @@ def chat_turn(
     user_text: str,
     user_ctx: Optional[Dict] = None,
     provider: Optional[str] = None,
-) -> tuple[str, List[Dict]]:
+) -> tuple[str, List[Dict], Dict[str, Any]]:
     """
     Process one conversational turn with tool calling.
     
@@ -66,6 +66,7 @@ def chat_turn(
         text = llm.simple_response(messages, temperature=0.2)
         return text, []
 
+    start_time = datetime.now()
     response = llm.chat_completion(
         messages=messages,
         tools=TOOL_SCHEMAS,
@@ -142,7 +143,9 @@ def chat_turn(
         msg = response.choices[0].message
     
     # Return final answer
-    return msg.content, tool_results
+    latency_ms = (datetime.now() - start_time).total_seconds() * 1000
+    meta = {"provider": provider or "openai", "latency_ms": round(latency_ms, 2)}
+    return msg.content, tool_results, meta
 
 
 def chat_stream(
@@ -160,10 +163,10 @@ def chat_stream(
     """
     # TODO: Implement streaming with tool calls
     # For now, just call chat_turn and yield the result
-    response, tools = chat_turn(history, user_text, user_ctx, provider=provider)
+    response, tools, meta = chat_turn(history, user_text, user_ctx, provider=provider)
     if tools:
         yield {"type": "tools", "data": tools}
-    yield {"type": "response", "data": response}
+    yield {"type": "response", "data": response, "meta": meta}
 
 
 # Example usage / testing

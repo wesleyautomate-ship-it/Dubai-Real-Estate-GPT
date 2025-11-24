@@ -20,6 +20,7 @@ import json
 
 import pandas as pd
 import psycopg2
+from dotenv import load_dotenv
 from psycopg2 import sql
 from psycopg2.extras import execute_values
 from psycopg2.extras import RealDictCursor
@@ -139,8 +140,38 @@ def infer_bedrooms(raw_value: Optional[object], property_type: Optional[str]) ->
     return None, "unknown", None
 
 
+def map_completion_status(value: Optional[str]) -> str:
+    if not value:
+        return "unknown"
+    v = value.lower()
+    if "ready" in v or "completed" in v:
+        return "ready"
+    if "off" in v or "plan" in v:
+        return "off_plan"
+    if "construct" in v:
+        return "under_construction"
+    return "unknown"
+
+
+def map_property_usage(value: Optional[str]) -> str:
+    if not value:
+        return "unknown"
+    v = value.lower()
+    if "resident" in v:
+        return "residential"
+    if "commerc" in v or "office" in v or "retail" in v:
+        return "commercial"
+    if "hotel" in v:
+        return "hotel"
+    if "industrial" in v or "warehouse" in v:
+        return "industrial"
+    if "mix" in v:
+        return "mixed_use"
+    return "unknown"
+
+
 @dataclass
-class SupabaseDB:
+class NeonDB:
     dsn: str
 
     def __post_init__(self) -> None:
@@ -148,7 +179,7 @@ class SupabaseDB:
         self.conn.autocommit = False
         with self.conn.cursor() as cur:
             cur.execute("SET statement_timeout TO 0")
-        print("Connected to database.")
+        print("Connected to Neon database.")
         self.community_cache: Dict[str, int] = {}
         self.district_cache: Dict[Tuple[int, str], int] = {}
         self.project_cache: Dict[Tuple[int, Optional[int], str], int] = {}
@@ -370,33 +401,76 @@ class SupabaseDB:
             self.building_cache.update(mapping)
             return mapping
 
-    def ensure_owners_bulk(self, entries: Sequence[Tuple[str, Optional[str]]]) -> Dict[str, int]:
-        dedup = {}
-        for norm, raw in entries:
-            if not norm:
-                continue
-            dedup.setdefault(norm, raw)
-        if not dedup:
+    def ensure_owners_bulk(self, owner_data: Dict[str, Dict[str, object]]) -> Dict[str, int]:
+        """
+        owner_data: {norm_name: {'name': raw_name, 'nationality': ..., 'birth_date': ...}}
+        """
+        if not owner_data:
             return {}
-        rows = [(raw, norm) for norm, raw in dedup.items()]
-        norm_names = list(dedup.keys())
+            
+        # 1. Resolve existing owners by name
+        names = [d['name'] for d in owner_data.values() if d['name']]
+        # Also check by norm_name if we had it, but we only have name in DB.
+        # We'll assume 'name' in DB corresponds to the raw name we have.
+        
+        # Actually, to do this right with deduplication, we need to query.
+        # For simplicity in this script, let's query by the names we're about to insert.
+        unique_names = list({d['name'] for d in owner_data.values() if d['name']})
+        
+        mapping = {}
         with self.conn.cursor() as cur:
-            execute_values(
-                cur,
-                """
-                INSERT INTO owners (raw_name, norm_name)
-                VALUES %s
-                ON CONFLICT (norm_name) DO UPDATE SET raw_name = EXCLUDED.raw_name
-                """,
-                rows,
-            )
-            cur.execute(
-                "SELECT id, norm_name FROM owners WHERE norm_name = ANY(%s)",
-                (norm_names,),
-            )
-            mapping = {row["norm_name"]: row["id"] for row in cur.fetchall()}
-            self.owner_cache.update(mapping)
-            return mapping
+            cur.execute("SELECT id, name FROM owners WHERE name = ANY(%s)", (unique_names,))
+            for row in cur.fetchall():
+                mapping[row["name"]] = row["id"]
+                
+            # 2. Insert missing
+            to_insert = []
+            for norm, data in owner_data.items():
+                raw_name = data['name']
+                if raw_name not in mapping:
+                    # We only insert if this exact name isn't there.
+                    # Note: This is imperfect if "John Smith" exists but we have "JOHN SMITH".
+                    # But we are stuck with what the DB has.
+                    to_insert.append((
+                        raw_name, 
+                        'person', 
+                        data.get('nationality'), 
+                        data.get('birth_date')
+                    ))
+            
+            if to_insert:
+                # Deduplicate to_insert by name to avoid unique violation if we tried to enforce it,
+                # though currently only ID is PK.
+                dedup_insert = {}
+                for row in to_insert:
+                    dedup_insert[row[0]] = row
+                
+                values = list(dedup_insert.values())
+                
+                inserted_rows = execute_values(
+                    cur,
+                    """
+                    INSERT INTO owners (name, owner_type, nationality, birth_date) 
+                    VALUES %s 
+                    RETURNING id, name
+                    """,
+                    values,
+                    fetch=True
+                )
+                for row in inserted_rows:
+                    mapping[row["name"]] = row["id"]
+        
+        # 3. Build result map (norm_name -> id)
+        result = {}
+        for norm, data in owner_data.items():
+            raw_name = data['name']
+            if raw_name in mapping:
+                result[norm] = mapping[raw_name]
+            else:
+                print(f"WARNING: Name '{raw_name}' (norm '{norm}') not found in mapping after insert!")
+                
+        self.owner_cache.update(result)
+        return result
 
     def ensure_owner_contacts(self, owner_id: int, phones: Sequence[str]) -> None:
         if not phones:
@@ -409,7 +483,7 @@ class SupabaseDB:
             if key in self.contact_cache:
                 continue
             self.contact_cache.add(key)
-            values.append((owner_id, "phone", phone, idx == 0))
+            values.append((owner_id, "mobile", phone, idx == 0))
         if not values:
             return
         with self.conn.cursor() as cur:
@@ -418,7 +492,7 @@ class SupabaseDB:
                 """
                 INSERT INTO owner_contacts (owner_id, contact_type, value, is_primary)
                 VALUES %s
-                ON CONFLICT DO NOTHING
+                ON CONFLICT (owner_id, contact_type, value) DO NOTHING
                 """,
                 values,
             )
@@ -476,11 +550,9 @@ class SupabaseDB:
     def bulk_upsert_properties(self, rows: List[Tuple], columns: List[str]) -> Dict[Tuple[int, str], int]:
         if not rows:
             return {}
-        # Deduplicate rows by (building_id, unit_identifier) to avoid ON CONFLICT re-touching
         unique: Dict[Tuple[Optional[int], Optional[str]], Tuple] = {}
         building_idx = columns.index("building_id")
         unit_idx = columns.index("unit_identifier")
-        normalized_rows: List[Tuple] = []
         for row in rows:
             as_list = list(row)
             building_val = as_list[building_idx]
@@ -577,9 +649,9 @@ def parse_row_latest(row: pd.Series, filename: str) -> Dict[str, object]:
     building_2 = clean_string(row.get("BuildingName 2"))
     property_number = normalize_identifier(row.get("property_number"))
     unit_number = normalize_unit_identifier(row.get("UnitNumber"))
-    completion = clean_string(row.get("Completion Status")) or "unknown"
+    completion = clean_string(row.get("Completion Status"))
     property_type = clean_string(row.get("Property Type"))
-    usage = clean_string(row.get("Usage")) or "unknown"
+    usage = clean_string(row.get("Usage"))
     sub_type = clean_string(row.get("Sub Type"))
 
     bedrooms, bedrooms_source, bedrooms_confidence = infer_bedrooms(
@@ -613,13 +685,15 @@ def parse_row_latest(row: pd.Series, filename: str) -> Dict[str, object]:
         "building": building_1 or building_2 or project,
         "building_alias": building_2 if building_1 else None,
         "transaction_date": transaction_date,
-        "completion": completion.lower(),
+        "completion": map_completion_status(completion),
         "property_type": property_type,
-        "usage": usage.lower() if usage else "unknown",
+        "usage": map_property_usage(usage),
         "sub_type": sub_type,
         "unit_number": unit_number or property_number,
         "property_number": property_number,
         "owner_name": owner_name,
+        "nationality": None,
+        "birth_date": None,
         "phones": phones,
         "bedrooms": bedrooms,
         "bedrooms_source": bedrooms_source,
@@ -703,6 +777,13 @@ def transform_downtown_jan(df: pd.DataFrame) -> List[Dict[str, object]]:
         if pd.isna(transaction_date):
             continue
         size_sqm = to_decimal(row.get("Size"))
+        
+        birth_date = pd.to_datetime(row.get("BirthDate"), errors="coerce")
+        if pd.isna(birth_date):
+            birth_date = None
+        else:
+            birth_date = birth_date.date()
+            
         records.append(
             {
                 "master_community": building_info["master"],
@@ -719,6 +800,8 @@ def transform_downtown_jan(df: pd.DataFrame) -> List[Dict[str, object]]:
         "unit_number": normalize_unit_identifier(row.get("UnitNumber")),
                 "property_number": None,
                 "owner_name": row.get("NameEn"),
+                "nationality": row.get("CountryNameEn"),
+                "birth_date": birth_date,
                 "phones": [normalize_phone(row.get("Mobile"))],
                 "bedrooms": None,
                 "bedrooms_source": "unknown",
@@ -744,7 +827,7 @@ def parse_row(row: pd.Series, filename: str) -> Dict[str, object]:
     return parse_row_latest(row, filename)
 
 
-def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip_rows: int = 0) -> None:
+def ingest_file(db: NeonDB, path: Path, max_rows: Optional[int] = None, skip_rows: int = 0) -> None:
     df = load_dataframe(path)
     df = df.fillna("")
     if skip_rows:
@@ -812,12 +895,25 @@ def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip
             for rec in records
         ]
     )
-    owner_keys = []
+    owner_data_map = {}
     for rec in records:
         norm = normalize_name(rec["owner_name"]) or rec["owner_name"] or "UNKNOWN"
         rec["owner_key"] = norm
-        owner_keys.append((norm, rec["owner_name"]))
-    owner_map = db.ensure_owners_bulk(owner_keys)
+        # Keep the best data for this owner (e.g. if one row has nationality/birthdate and another doesn't)
+        if norm not in owner_data_map:
+            owner_data_map[norm] = {
+                "name": rec["owner_name"] or norm, 
+                "nationality": rec.get("nationality"), 
+                "birth_date": rec.get("birth_date")
+            }
+        else:
+            # Enrich if missing
+            if not owner_data_map[norm]["nationality"] and rec.get("nationality"):
+                owner_data_map[norm]["nationality"] = rec.get("nationality")
+            if not owner_data_map[norm]["birth_date"] and rec.get("birth_date"):
+                owner_data_map[norm]["birth_date"] = rec.get("birth_date")
+                
+    owner_map = db.ensure_owners_bulk(owner_data_map)
 
     property_rows_dict: Dict[Tuple[int, str], Tuple] = {}
     property_records: Dict[Tuple[int, str], Dict[str, object]] = {}
@@ -829,12 +925,6 @@ def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip
         "project_id",
         "cluster_id",
         "building_id",
-        "master_community",
-        "community_name",
-        "sub_community_name",
-        "project_name",
-        "building_name",
-        "tower_name",
         "unit_identifier",
         "property_number",
         "completion",
@@ -842,8 +932,6 @@ def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip
         "usage",
         "sub_type",
         "bedrooms",
-        "bedrooms_source",
-        "bedrooms_confidence",
         "bathrooms",
         "status",
         "owner_id",
@@ -862,15 +950,6 @@ def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip
 
     transaction_columns = [
         "property_id",
-        "community_id",
-        "district_id",
-        "project_id",
-        "building_id",
-        "master_community",
-        "community_name",
-        "project_name",
-        "building_name",
-        "unit_identifier",
         "transaction_date",
         "price",
         "price_per_sqm",
@@ -883,15 +962,7 @@ def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip
         "bathrooms",
         "actual_size_sqm",
         "actual_size_sqft",
-        "built_up_sqm",
-        "built_up_sqft",
-        "plot_size_sqm",
-        "plot_size_sqft",
-        "municipality_no",
-        "municipality_sub_no",
-        "land_number",
         "buyer_owner_id",
-        "buyer_name",
     ]
 
     for idx, rec in enumerate(records, start=1):
@@ -925,12 +996,6 @@ def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip
                     project_id,
                     cluster_id,
                     building_id,
-                    rec["master_community"],
-                    rec["community"],
-                    rec["district"],
-                    rec["project"],
-                    rec["building"],
-                    rec.get("building_alias"),
                     rec["unit_number"],
                     rec["property_number"],
                     rec["completion"],
@@ -938,8 +1003,6 @@ def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip
                     rec["usage"],
                     rec["sub_type"],
                     rec["bedrooms"],
-                    rec["bedrooms_source"],
-                    rec["bedrooms_confidence"],
                     rec["bathrooms"],
                     "owned",
                     owner_id,
@@ -972,15 +1035,6 @@ def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip
         transaction_rows.append(
             (
                 property_id,
-                rec["community_id"],
-                rec["district_id"],
-                rec["project_id"],
-                rec["building_id"],
-                rec["master_community"],
-                rec["community"],
-                rec["project"],
-                rec["building"],
-                rec["unit_number"],
                 rec["transaction_date"],
                 rec["transaction_amount"],
                 (rec["transaction_amount"] / rec["actual_size_sqm"]) if rec["transaction_amount"] and rec["actual_size_sqm"] else None,
@@ -993,15 +1047,7 @@ def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip
                 rec["bathrooms"],
                 rec["actual_size_sqm"],
                 rec["actual_size_sqft"],
-                rec["built_up_sqm"],
-                rec["built_up_sqft"],
-                rec["plot_size_sqm"],
-                rec["plot_size_sqft"],
-                rec["municipality_no"],
-                rec["municipality_sub_no"],
-                rec["land_number"],
                 rec["owner_id"],
-                rec["owner_name"],
             )
         )
 
@@ -1016,6 +1062,7 @@ def ingest_file(db: SupabaseDB, path: Path, max_rows: Optional[int] = None, skip
 # -----------------------------------------------------------------------------
 
 def main() -> None:
+    load_dotenv()
     parser = argparse.ArgumentParser(description="Ingest Dubai Excel data per community.")
     parser.add_argument(
         "--files",
@@ -1036,9 +1083,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    db_url = os.getenv("SUPABASE_DB_URL")
+    db_url = os.getenv("NEON_DB_URL")
     if not db_url:
-        raise SystemExit("SUPABASE_DB_URL not set.")
+        # Fallback or error
+        db_url = os.getenv("SUPABASE_DB_URL")
+        if not db_url:
+            raise SystemExit("NEON_DB_URL and SUPABASE_DB_URL not set.")
+        print("Warning: Using SUPABASE_DB_URL as fallback.")
 
     files_to_ingest: List[Path] = []
     normalized = {f.lower(): f for f in args.files}
@@ -1051,7 +1102,7 @@ def main() -> None:
     if not files_to_ingest:
         raise SystemExit("No files matched the provided --files arguments.")
 
-    db = SupabaseDB(db_url)
+    db = NeonDB(db_url)
     try:
         for path in files_to_ingest:
             print(f"Ingesting {path.name} (skip {args.skip_rows}, max {args.max_rows}) ...")
